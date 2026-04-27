@@ -1,0 +1,35 @@
+# Arbitration Configuration
+# Research-backed weights and thresholds for conflict resolution
+
+arbitration:
+  weights:
+    confidence: 0.4
+    provenance: 0.3
+    recency: 0.2
+    authority: 0.1
+  recency_half_life: 3600.0  # seconds
+
+thresholds:
+  overwrite_margin: 0.2              # Minimum score difference to prefer overwrite (increased for stale handling)
+  keep_multiple_versions_margin: 0.4 # Score margin too close -> keep both (increased from 0.08)
+  defer_below_score: 0.40            # New entry score below this -> defer
+  semantic_duplicate: 0.95           # Cosine similarity threshold for exact duplicate
+  semantic_overlap: 0.70             # Threshold for significant overlap
+  contradiction_low_similarity: 0.30 # Below this similarity, consider contradiction
+
+decay:
+  lambda_base: 0.0001              # Base decay rate for recency
+  recall_boost_beta: 0.3           # How much recall reduces decay
+  recall_boost_gamma: 0.1          # Scaling factor for recall count in tanh
+
+# Provenance weights (should match those in conflict_aware_writer.py)
+provenance_weights:
+  explicit: 1.0
+  behavioral: 0.85
+  inferred: 0.7
+  llm_inferred: 0.6
+  unknown: 0.4
+
+# Authority configuration
+use_agent_authority: false        # Set to true if agent_authority is populated
+default_authority: 1.0             # Default authority score when not available

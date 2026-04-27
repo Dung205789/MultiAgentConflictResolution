@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  memory-benchmark:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # Pass HF_TOKEN to pre-download models during build
+      args:
+        - HF_TOKEN=${HF_TOKEN:-}
+    container_name: multi-agent-memory-benchmark
+    # runtime: nvidia  # Use NVIDIA runtime if GPU available (remove for CPU-only)
+    environment:
+      # Hugging Face token for downloading models (required for first run)
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Agent models (change as needed)
+      - AGENT1_MODEL=${AGENT1_MODEL:-Qwen/Qwen2.5-3B-Instruct}
+      - AGENT2_MODEL=${AGENT2_MODEL:-Qwen/Qwen2.5-7B-Instruct}
+      - AGENT1_RELIABILITY=${AGENT1_RELIABILITY:-0.85}
+      - AGENT2_RELIABILITY=${AGENT2_RELIABILITY:-0.75}
+      # PyTorch settings
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+    volumes:
+      # Mount local cache to avoid re-downloading models
+      - huggingface_cache:/root/.cache/huggingface
+      # Mount project directory for code updates
+      - ./:/app
+      # Mount reports directory for output
+      - ./reports:/app/reports
+    working_dir: /app
+    # Override command as needed:
+    # Default: run with dummy agents (fast test)
+    # command: ["python", "run_agent_memory_comparison.py", "--num-scenarios", "10", "--use-dummy"]
+    # For real models:
+    # command: ["python", "run_agent_memory_comparison.py", "--num-scenarios", "35"]
+    # Or specify custom models:
+    # command: ["python", "run_agent_memory_comparison.py", "--num-scenarios", "35", "--agent1-model", "Qwen/Qwen2.5-3B-Instruct", "--agent2-model", "Qwen/Qwen2.5-7B-Instruct"]
+    networks:
+      - benchmark-network
+
+volumes:
+  huggingface_cache:
+    driver: local
+
+networks:
+  benchmark-network:
+    driver: bridge

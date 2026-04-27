@@ -1,0 +1,43 @@
+# Docker ignore for memory layer project
+
+# Version control
+.git
+.gitignore
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+.conda/
+
+# IDE
+.vscode/
+.idea
+*.swp
+*.swo
+
+# Project-specific
+*.zip
+.claude.zip
+requirements.zip
+
+# Local data (optional, keep if you want to include benchmark)
+# data/*.jsonl
+
+# Reports (generated)
+reports/*.json
+reports/*.txt
+reports/*.png
+
+# Temporary files
+tmp_*
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

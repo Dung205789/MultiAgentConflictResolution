@@ -1,0 +1,18 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+
+# Environments and secrets
+.env
+.venv/
+venv/
+
+# Large local assets / runtime artifacts
+data/
+models_cache/
+reports/
+*.zip
+tmp_*.jsonl
+
+# Tooling
+.claude/
