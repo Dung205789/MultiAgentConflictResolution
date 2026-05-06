@@ -81,7 +81,7 @@ def generate_keep_multiple_versions_scenario(
                 "proposal": {
                     "subject": subject,
                     "predicate": predicate,
-                    "object_val": "perspective_a",
+                    "object_val": "enjoys outdoor activities like hiking and camping",
                     "confidence": 0.8,
                     "provenance": "explicit"
                 }
@@ -93,7 +93,7 @@ def generate_keep_multiple_versions_scenario(
                 "proposal": {
                     "subject": subject,
                     "predicate": predicate,
-                    "object_val": "perspective_b",
+                    "object_val": "prefers indoor activities such as painting and chess",
                     "confidence": 0.8,
                     "provenance": "explicit"
                 }
@@ -103,12 +103,12 @@ def generate_keep_multiple_versions_scenario(
         gold_conflict_type="compatible_extension",
         gold_resolution_action="keep_multiple_versions",
         gold_reconciled_memory_state=[
-            {"subject": subject, "predicate": predicate, "object_val": "perspective_a", "status": "active"},
-            {"subject": subject, "predicate": predicate, "object_val": "perspective_b", "status": "active"}
+            {"subject": subject, "predicate": predicate, "object_val": "enjoys outdoor activities like hiking and camping", "status": "active"},
+            {"subject": subject, "predicate": predicate, "object_val": "prefers indoor activities such as painting and chess", "status": "active"}
         ],
         gold_visible_shared_state_after_commit=[
-            {"subject": subject, "predicate": predicate, "object_val": "perspective_a"},
-            {"subject": subject, "predicate": predicate, "object_val": "perspective_b"}
+            {"subject": subject, "predicate": predicate, "object_val": "enjoys outdoor activities like hiking and camping"},
+            {"subject": subject, "predicate": predicate, "object_val": "prefers indoor activities such as painting and chess"}
         ],
         description="Similar confidence entries with different but valid perspectives should both be kept",
         agent_profiles=agent_profiles,

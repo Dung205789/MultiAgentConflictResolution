@@ -10,6 +10,18 @@ from src.memory.shared_memory_store import SharedMemoryStore, MemoryEntry
 from src.conflict.staleness_detector import StalenessDetector
 from src.conflict.conflict_detector import detect_conflict_type
 
+# Lazy import - load only when meta-learning is enabled
+ArbitrationHistoryTracker = None
+ArbitrationRecord = None
+
+def _ensure_history_import():
+    global ArbitrationHistoryTracker, ArbitrationRecord
+    if ArbitrationHistoryTracker is None:
+        from src.conflict.arbitration_history import ArbitrationHistoryTracker as AHT
+        from src.conflict.arbitration_history import ArbitrationRecord as AR
+        ArbitrationHistoryTracker = AHT
+        ArbitrationRecord = AR
+
 try:
     import yaml
     HAVE_YAML = True
@@ -95,6 +107,38 @@ class ConflictAwareWriter:
             print(f"Warning: Failed to load config from {config_path}: {e}, using defaults")
             return {}
 
+    def _get_context_weights(self, scenario_id: Optional[str] = None) -> Dict[str, float]:
+        """
+        Get context-specific arbitration weights.
+        Falls back to base weights if no scenario override exists.
+        """
+        context_weights = self.config.get("context_weights", {})
+        if scenario_id and scenario_id in context_weights:
+            return context_weights[scenario_id]
+        return self.arbitration_weights
+
+    def _calculate_uncertainty(self, mem: Dict[str, Any], recency_ref: float) -> float:
+        """
+        Calculate epistemic uncertainty for a memory entry.
+        Combines low confidence, weak provenance, staleness, and low authority.
+        Returns a value in [0, 1] where 1 = maximally uncertain.
+        """
+        confidence = float(mem.get("confidence", 0.0))
+        provenance_type = str(mem.get("provenance", "unknown"))
+        provenance_score = self.provenance_weights.get(provenance_type, 0.4)
+        timestamp = float(mem.get("committed_at") or mem.get("timestamp") or 0.0)
+        recency_score = self._normalize_recency(timestamp, recency_ref)
+        authority_score = float(mem.get("agent_authority", 1.0))
+
+        # Uncertainty = 1 - weighted combination of certainty signals
+        certainty = (
+            0.35 * confidence +
+            0.25 * provenance_score +
+            0.25 * recency_score +
+            0.15 * authority_score
+        )
+        return max(0.0, min(1.0, 1.0 - certainty))
+
     def _retrieve_candidates(self, proposal: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Retrieve all visible candidates with the same subject and predicate."""
         visible = [r.to_dict() for r in self.store.get_all_visible()]
@@ -122,17 +166,20 @@ class ConflictAwareWriter:
         # Exponential decay: score = 2^(-time_diff/half_life)
         return 2 ** (-time_diff / self.recency_half_life)
 
-    def _score_memory(self, mem: Dict[str, Any], recency_ref: float) -> Dict[str, float]:
+    def _score_memory(self, mem: Dict[str, Any], recency_ref: float, context_weights: Optional[Dict[str, float]] = None) -> Dict[str, float]:
         """
         Score a memory entry based on confidence, provenance, recency, and authority.
 
         Args:
             mem: Memory entry to score
             recency_ref: Reference time for recency normalization
+            context_weights: Optional scenario-specific weights override
 
         Returns:
             Dictionary with individual scores and total score
         """
+        weights = context_weights or self.arbitration_weights
+
         # Extract and normalize individual factors
         confidence = float(mem.get("confidence", 0.0))
 
@@ -147,11 +194,14 @@ class ConflictAwareWriter:
 
         # Calculate weighted total score using arbitration weights
         total_score = (
-            self.arbitration_weights.get("confidence", 0.4) * confidence +
-            self.arbitration_weights.get("provenance", 0.3) * provenance_score +
-            self.arbitration_weights.get("recency", 0.2) * recency_score +
-            self.arbitration_weights.get("authority", 0.1) * authority_score
+            weights.get("confidence", 0.4) * confidence +
+            weights.get("provenance", 0.3) * provenance_score +
+            weights.get("recency", 0.2) * recency_score +
+            weights.get("authority", 0.1) * authority_score
         )
+
+        # Calculate uncertainty
+        uncertainty = self._calculate_uncertainty(mem, recency_ref)
 
         return {
             "confidence": confidence,
@@ -160,6 +210,7 @@ class ConflictAwareWriter:
             "authority": authority_score,
             "total": total_score,
             "provenance_type": provenance_type,
+            "uncertainty": uncertainty,
         }
 
     def _arbitrate(
@@ -167,157 +218,215 @@ class ConflictAwareWriter:
         conflict_type: str,
         conflict_details: Dict[str, Any],
         proposal: Dict[str, Any],
-        candidates: List[Dict[str, Any]]
+        candidates: List[Dict[str, Any]],
+        scenario_id: Optional[str] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
-        Enhanced arbitration logic with more principled decision making.
-        
+        Enhanced arbitration logic with context weights, uncertainty, and history tracking.
+
         Args:
             conflict_type: Type of conflict detected
             conflict_details: Additional details about the conflict
             proposal: The proposed memory entry
             candidates: Existing memory entries with the same subject and predicate
-            
+            scenario_id: Optional scenario context for dynamic weight adjustment
+
         Returns:
             Tuple of (action, details)
         """
+        # Resolve context-specific weights
+        context_weights = self._get_context_weights(scenario_id)
+
         # No conflict case
         if conflict_type == "none":
             return "append", {"reason": "no_conflict"}
-        
+
         # Duplicate handling
         if conflict_type in ["exact_duplicate", "semantic_duplicate"]:
             return "reject", {"reason": f"{conflict_type}_detected", "details": conflict_details}
-        
+
         # Get the latest candidate for comparison
         latest = candidates[-1] if candidates else {}
-        
+
         # Calculate reference time for recency normalization
         recency_ref = time.time()
-        
+
         # Score both the proposal and the latest candidate
         proposal_scored = dict(proposal)
         proposal_scored["agent_authority"] = float(proposal.get("agent_authority", 0.5))
         proposal_scored["timestamp"] = time.time()
-        
-        new_scores = self._score_memory(proposal_scored, recency_ref)
-        old_scores = self._score_memory(latest, recency_ref) if latest else {"total": 0.0}
-        
+
+        new_scores = self._score_memory(proposal_scored, recency_ref, context_weights)
+        old_scores = self._score_memory(latest, recency_ref, context_weights) if latest else {"total": 0.0, "uncertainty": 1.0}
+
         # Calculate score margin
         margin = new_scores["total"] - old_scores["total"]
         confidence_margin = new_scores["confidence"] - old_scores.get("confidence", 0.0)
-        
+
+        # Log to arbitration history if enabled
+        if proposal.get("_enable_history_tracking", False):
+            _ensure_history_import()
+            if ArbitrationHistoryTracker is not None:
+                tracker = ArbitrationHistoryTracker(self.store)
+                record = ArbitrationRecord(
+                    scenario_id=scenario_id or "default",
+                    conflict_type=conflict_type,
+                    proposal_scores=new_scores,
+                    candidate_scores=old_scores,
+                    action=None,  # will be set below
+                    uncertainty=new_scores.get("uncertainty", 0.0),
+                )
+                # Defer commit until action is decided
+                # Store temporarily for later update
+                proposal["_temp_history_record"] = record
+                proposal["_temp_history_tracker"] = tracker
+
         # Stale read conflict handling
         if conflict_type == "stale_read_conflict":
+            # Factor in uncertainty: high uncertainty in old entry favors overwrite
+            old_uncertainty = old_scores.get("uncertainty", 0.0)
+            effective_margin = margin + (old_uncertainty * 0.1)
+
             # If the new entry has significantly higher confidence, overwrite despite staleness
-            if confidence_margin > self.arbitration_thresholds.get("overwrite_margin", 0.15):
-                return "overwrite", {
+            if effective_margin > self.arbitration_thresholds.get("overwrite_margin", 0.15):
+                action = "overwrite"
+                return action, {
                     "reason": "high_confidence_despite_staleness",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
                     "margin": margin,
+                    "effective_margin": effective_margin,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
             # Otherwise, defer to manual review
-            return "defer", {
+            action = "defer"
+            return action, {
                 "reason": "stale_read_requires_review",
                 "new_scores": new_scores,
                 "old_scores": old_scores,
                 "margin": margin,
+                "uncertainty": new_scores.get("uncertainty", 0.0),
             }
-        
+
         # Semantic overlap handling - good candidate for merging
         if conflict_type == "semantic_overlap":
             # Special case: if both values are JSON objects, always merge
             if conflict_details.get("json_mergeable"):
-                return "merge", {
+                action = "merge"
+                return action, {
                     "reason": "json_objects_mergeable",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
             similarity = conflict_details.get("similarity", 0.0)
             # High similarity but not duplicate - merge
             if similarity >= 0.7:
-                return "merge", {
+                action = "merge"
+                return action, {
                     "reason": "high_semantic_overlap_suitable_for_merge",
                     "similarity": similarity,
                     "new_scores": new_scores,
                     "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
             # Moderate similarity - keep both if confidence is similar
             elif abs(confidence_margin) < self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08):
-                return "keep_multiple_versions", {
+                action = "keep_multiple_versions"
+                return action, {
                     "reason": "moderate_overlap_similar_confidence",
                     "similarity": similarity,
                     "new_scores": new_scores,
                     "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
             # Otherwise, prefer the higher confidence one
             elif confidence_margin > 0:
-                return "overwrite", {
+                action = "overwrite"
+                return action, {
                     "reason": "higher_confidence_moderate_overlap",
                     "similarity": similarity,
                     "new_scores": new_scores,
                     "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
             else:
-                return "reject", {
+                action = "reject"
+                return action, {
                     "reason": "lower_confidence_moderate_overlap",
                     "similarity": similarity,
                     "new_scores": new_scores,
                     "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
-        
+
         # Compatible extension - keep both versions
         if conflict_type == "compatible_extension":
-            return "keep_multiple_versions", {
+            action = "keep_multiple_versions"
+            return action, {
                 "reason": "compatible_information",
                 "new_scores": new_scores,
                 "old_scores": old_scores,
+                "uncertainty": new_scores.get("uncertainty", 0.0),
             }
-        
+
         # Mutually exclusive or potential contradiction
         if conflict_type in ["mutually_exclusive", "potential_contradiction"]:
+            # Factor in uncertainty: high uncertainty favors the newer entry
+            new_uncertainty = new_scores.get("uncertainty", 0.0)
+            old_uncertainty = old_scores.get("uncertainty", 0.0)
+            uncertainty_adjustment = (old_uncertainty - new_uncertainty) * 0.1
+            effective_margin = margin + uncertainty_adjustment
+
             # If new entry has significantly higher confidence, overwrite
-            if confidence_margin > self.arbitration_thresholds.get("overwrite_margin", 0.15):
-                return "overwrite", {
+            if effective_margin > self.arbitration_thresholds.get("overwrite_margin", 0.15):
+                action = "overwrite"
+                return action, {
                     "reason": "higher_confidence_contradiction",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
                     "margin": margin,
+                    "effective_margin": effective_margin,
+                    "uncertainty": new_uncertainty,
                 }
             # If similar confidence, use recency to break tie for mutually_exclusive
-            # (newer information is generally better)
-            elif abs(confidence_margin) < self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08):
+            elif abs(effective_margin) < self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08):
                 if conflict_type == "mutually_exclusive":
-                    # For mutually exclusive, prefer the newer entry (overwrite)
-                    # The new entry is newer by construction (higher timestamp)
-                    return "overwrite", {
+                    action = "overwrite"
+                    return action, {
                         "reason": "mutually_exclusive_newer_info_overwrites",
                         "new_scores": new_scores,
                         "old_scores": old_scores,
+                        "uncertainty": new_uncertainty,
                     }
                 else:  # potential_contradiction
-                    return "keep_multiple_versions", {
+                    action = "keep_multiple_versions"
+                    return action, {
                         "reason": "contradictory_similar_confidence",
                         "new_scores": new_scores,
                         "old_scores": old_scores,
                         "contradiction_type": conflict_type,
+                        "uncertainty": new_uncertainty,
                     }
             # If lower confidence, reject
             else:
-                return "reject", {
+                action = "reject"
+                return action, {
                     "reason": "lower_confidence_contradiction",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
                     "margin": margin,
+                    "uncertainty": new_uncertainty,
                 }
-        
+
         # Default case - defer to manual review
-        return "defer", {
+        action = "defer"
+        return action, {
             "reason": "unhandled_conflict_type",
             "conflict_type": conflict_type,
             "new_scores": new_scores,
             "old_scores": old_scores,
+            "uncertainty": new_scores.get("uncertainty", 0.0),
         }
 
     def _build_entry(self, proposal: Dict[str, Any], agent_id: str, candidates: List[Dict[str, Any]]) -> MemoryEntry:
@@ -455,26 +564,36 @@ class ConflictAwareWriter:
                 "review_priority": "high" if conflict_type in ["mutually_exclusive", "stale_read_conflict"] else "medium",
             })
 
-    def write(self, proposal: Dict[str, Any], agent_id: str, read_snapshot_time: float) -> Dict[str, Any]:
+    def write(self, proposal: Dict[str, Any], agent_id: str, read_snapshot_time: float, scenario_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Write a proposal to the memory store with conflict awareness.
-        
+
         Args:
             proposal: The proposed memory entry
             agent_id: ID of the agent making the proposal
             read_snapshot_time: When the agent read the memory before making this proposal
-            
+            scenario_id: Optional scenario context for dynamic weight adjustment
+
         Returns:
             Result of the write operation
         """
-        # Retrieve candidates and detect conflicts
         candidates = self._retrieve_candidates(proposal)
         conflict_type, conflict_details = detect_conflict_type(
             proposal, candidates, read_snapshot_time, self.staleness_detector, mode=self.mode
         )
-        
-        # Arbitrate to decide action
-        action, arbitration_details = self._arbitrate(conflict_type, conflict_details, proposal, candidates)
+
+        # Arbitrate to decide action (with scenario context)
+        action, arbitration_details = self._arbitrate(
+            conflict_type, conflict_details, proposal, candidates, scenario_id
+        )
+
+        # Commit arbitration history if tracking is enabled
+        if proposal.get("_enable_history_tracking", False) and "_temp_history_record" in proposal:
+            record = proposal.pop("_temp_history_record")
+            tracker = proposal.pop("_temp_history_tracker", None)
+            if tracker is not None:
+                record.action = action
+                tracker.commit_record(record)
 
         # Handle rejection without creating an entry
         if action == "reject":
@@ -497,11 +616,12 @@ class ConflictAwareWriter:
         entry.arbitration_metadata.update({
             "conflict_type": conflict_type,
             "resolution_action": action,
+            "scenario_id": scenario_id,
         })
 
         # Propose the write to the store
         self.store.propose_write(entry)
-        
+
         # Commit with metadata
         self.store.commit(
             entry.memory_id,
@@ -510,6 +630,7 @@ class ConflictAwareWriter:
             arb_metadata={
                 "writer": "enhanced_conflict_aware",
                 "candidate_count": len(candidates),
+                "scenario_id": scenario_id,
                 "arbitration_details": arbitration_details,
                 "conflict_details": conflict_details,
             },
@@ -517,7 +638,7 @@ class ConflictAwareWriter:
 
         # Apply action-specific effects
         self._apply_action_effects(entry, action, conflict_type, candidates, arbitration_details)
-        
+
         # Save and index
         self.store._save()
         self.store.set_indexed(entry.memory_id, delay=0.0)
@@ -529,6 +650,7 @@ class ConflictAwareWriter:
             "conflict_detected": conflict_type != "none",
             "conflict_type": conflict_type,
             "resolution_action": action,
+            "scenario_id": scenario_id,
             "candidate_count": len(candidates),
             "arbitration_details": arbitration_details,
             "conflict_details": conflict_details,

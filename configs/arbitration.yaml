@@ -10,8 +10,8 @@ arbitration:
   recency_half_life: 3600.0  # seconds
 
 thresholds:
-  overwrite_margin: 0.2              # Minimum score difference to prefer overwrite (increased for stale handling)
-  keep_multiple_versions_margin: 0.4 # Score margin too close -> keep both (increased from 0.08)
+  overwrite_margin: 0.12             # Minimum score difference to prefer overwrite
+  keep_multiple_versions_margin: 0.08 # Score margin too close -> keep both
   defer_below_score: 0.40            # New entry score below this -> defer
   semantic_duplicate: 0.95           # Cosine similarity threshold for exact duplicate
   semantic_overlap: 0.70             # Threshold for significant overlap
@@ -33,3 +33,32 @@ provenance_weights:
 # Authority configuration
 use_agent_authority: false        # Set to true if agent_authority is populated
 default_authority: 1.0             # Default authority score when not available
+
+# Context-specific weight overrides
+# Scenarios can dynamically adjust arbitration weights
+context_weights:
+  factual_dispute:
+    confidence: 0.5
+    provenance: 0.25
+    recency: 0.15
+    authority: 0.1
+  temporal_update:
+    confidence: 0.3
+    provenance: 0.2
+    recency: 0.4
+    authority: 0.1
+  cross_agent_merge:
+    confidence: 0.35
+    provenance: 0.35
+    recency: 0.2
+    authority: 0.1
+  low_uncertainty:
+    confidence: 0.5
+    provenance: 0.3
+    recency: 0.1
+    authority: 0.1
+  high_uncertainty:
+    confidence: 0.3
+    provenance: 0.25
+    recency: 0.25
+    authority: 0.2

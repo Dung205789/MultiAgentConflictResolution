@@ -21,3 +21,9 @@
 - Work in order, one step at a time.
 - After each step: short output only (file changed / result).
 - No long plan before starting. Just start.
+
+## Dynamic Contextual Arbitration
+- `conflict_aware_writer.py` supports scenario-specific weights via `context_weights` in `configs/arbitration.yaml`.
+- Pass `scenario_id` to `write()` to activate dynamic weights (e.g., `scenario_id="factual_dispute"`).
+- `_calculate_uncertainty()` factors into arbitration decisions for `stale_read_conflict` and contradiction cases.
+- Set `proposal["_enable_history_tracking"] = True` to log arbitration records via `ArbitrationHistoryTracker`.

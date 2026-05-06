@@ -12,7 +12,15 @@ HAVE_EMBEDDINGS = False
 SentenceTransformer = None
 cosine_similarity = None
 
-from src.utils.retriever import overlap_score
+# Lazy import for retriever
+_overlap_score_func = None
+
+def _get_overlap_score():
+    global _overlap_score_func
+    if _overlap_score_func is None:
+        from src.utils.retriever import overlap_score
+        _overlap_score_func = overlap_score
+    return _overlap_score_func
 
 # Constants for conflict detection
 DUPLICATE_THRESHOLD = 0.95  # Almost exact match
@@ -96,7 +104,8 @@ def semantic_similarity(text1: str, text2: str, mode: str = "debug_fallback") ->
         )
 
     # Use lexical overlap as fallback
-    sim = overlap_score(text1, text2)
+    overlap_func = _get_overlap_score()
+    sim = overlap_func(text1, text2)
     logging.debug(f"semantic_similarity: used lexical overlap (score={sim:.4f})")
     return sim
 

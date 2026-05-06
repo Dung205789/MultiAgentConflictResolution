@@ -98,7 +98,10 @@ class MultiAgentPipeline:
 
                 if self.mode == "conflict_aware":
                     read_snapshot_time = float(ev.get("read_snapshot_time", time.time()))
-                    result = self.conflict_writer.write(proposal, agent_id=aid, read_snapshot_time=read_snapshot_time)
+                    scenario_id = scenario.get("scenario_id")
+                    result = self.conflict_writer.write(
+                        proposal, agent_id=aid, read_snapshot_time=read_snapshot_time, scenario_id=scenario_id
+                    )
                 elif self.mode == "lww":
                     result = self.lww_writer.write(proposal, agent_id=aid)
                 else:
