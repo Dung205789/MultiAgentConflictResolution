@@ -1,18 +1,67 @@
-﻿# Python cache
+# Python
 __pycache__/
 *.py[cod]
-
-# Environments and secrets
-.env
-.venv/
+*$py.class
+*.so
+.Python
+env/
 venv/
+.venv/
+.env
+*.egg-info/
+dist/
+build/
 
-# Large local assets / runtime artifacts
-data/
-models_cache/
-reports/
-*.zip
-tmp_*.jsonl
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
 
-# Tooling
+# Project-specific logs and temp files
+*.log
+debug_*.py
+inspect_*.py
+count_*.py
+run_*.py
+test_*.py
+sample_*.json
+test_*.json
+test_*.txt
+*_output.txt
+full_*.log
+memae_*.log
+cloudflared.exe
+
+# Reports (generated)
+reports/*.json
+!reports/.gitkeep
+
+# Data processed (keep only raw)
+data/processed/
+data/outputs/
+
+# Raw benchmark data - downloaded separately (large files)
+# MemAB: Download from HuggingFace or use local parquet
+# LongMemEval: Auto-downloaded by adapter
+# MemoryAgentBench: Auto-downloaded by loader
+# data/raw/ is NOT committed - users must provide their own
+data/raw/
+
+# Model cache (download on demand)
+models/
+.cache/
+.hf_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Memory system
 .claude/
+.memory/
+
+# Checkpoints
+*.ckpt
+*.pt
+*.pth

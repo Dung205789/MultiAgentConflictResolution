@@ -1,29 +1,49 @@
 # CLAUDE.md
 
-## Response style
+## Project Context
+
+This is a research project on **rule-based multi-agent memory conflict resolution**. The system uses deterministic rules (not LLMs) for conflict detection and arbitration, achieving near-SOTA performance at a fraction of the cost.
+
+### Key Characteristics
+- **Constraint-based**: Operates without LLM dependencies in the critical path
+- **Unified format**: All datasets converted to ISF (Internal Standard Format)
+- **Single entry point**: `main.py` - use this for all evaluations
+- **Cost-effective**: 10-20x cheaper than LLM-based approaches
+
+### Current Status
+- Core pipeline fully functional
+- 3 adapters ready: MemAE, LongMemEval, SAFEFLOW
+- Optional adapters: MemoryAgentBench, LoCoMo
+- Comprehensive metrics and reporting
+
+## Response Style
 - Code first. Explain only if asked.
-- No preamble: never restate the request, never say "Sure!", "Great question!", "Let me help you with..."
-- No summaries at the end ("In summary...", "Hope this helps!")
-- If fixing a bug: just fix it. Don't describe what the bug is.
-- If multiple files need changes: change all of them in one shot.
+- No preamble: never restate the request
+- No summaries at the end
+- If fixing a bug: just fix it
+- For this research project: prioritize correctness and clarity over cleverness
 
-## Format
-- Use code blocks. Avoid prose when the answer is code.
-- Inline comments only when non-obvious.
-- No bullet points for things that fit in one line.
+## Important Notes
 
-## On errors
-- Read the traceback, fix immediately.
-- Don't ask for more context if the information is already there.
-- If something is truly missing: ask exactly one short question.
+### Entry Point
+Always use `main.py` as the primary entry point. Previous runner scripts have been consolidated.
 
-## On large tasks
-- Work in order, one step at a time.
-- After each step: short output only (file changed / result).
-- No long plan before starting. Just start.
+### Data Format
+All benchmark data must be in ISF format (see `src/format.py`). Use adapters from `src/benchmarks/adapters/` to convert external datasets.
 
-## Dynamic Contextual Arbitration
-- `conflict_aware_writer.py` supports scenario-specific weights via `context_weights` in `configs/arbitration.yaml`.
-- Pass `scenario_id` to `write()` to activate dynamic weights (e.g., `scenario_id="factual_dispute"`).
-- `_calculate_uncertainty()` factors into arbitration decisions for `stale_read_conflict` and contradiction cases.
-- Set `proposal["_enable_history_tracking"] = True` to log arbitration records via `ArbitrationHistoryTracker`.
+### Configuration
+Arbitration weights and thresholds are in `configs/arbitration.yaml`. Changes take effect immediately.
+
+### Novel Features
+- Dynamic contextual weights: Pass `scenario_id` to activate scenario-specific arbitration strategies
+- Uncertainty-aware decisions: Factors epistemic uncertainty into conflict resolution
+- Tiered detection: Rule-based → semantic → (optional) judge
+
+### Testing
+For quick validation:
+```bash
+python main.py --benchmark memae --max-scenarios 5 --use-dummy
+```
+
+### Documentation
+See `PROJECT_DOCUMENTATION.md` for comprehensive technical details.

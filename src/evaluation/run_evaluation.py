@@ -61,7 +61,9 @@ def run_evaluation_with_scenarios(
         mode_results = []
         scenario_iter = tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios)) if HAVE_TQDM else scenarios
         for scenario in scenario_iter:
-            res = pipeline.run_scenario(scenario, enable_retrieval_eval=bool(scenario.get("queries")))
+            # Convert Scenario object to dict if needed
+            scenario_dict = scenario.to_dict() if hasattr(scenario, 'to_dict') else scenario
+            res = pipeline.run_scenario(scenario_dict, enable_retrieval_eval=bool(scenario_dict.get("queries")))
             mode_results.append(res)
 
         # Store raw results for later breakdown
@@ -153,7 +155,9 @@ def run_evaluation(
         mode_results = []
         scenario_iter = tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios)) if HAVE_TQDM else scenarios
         for scenario in scenario_iter:
-            res = pipeline.run_scenario(scenario, enable_retrieval_eval=bool(scenario.get("queries")))
+            # Convert Scenario object to dict if needed
+            scenario_dict = scenario.to_dict() if hasattr(scenario, 'to_dict') else scenario
+            res = pipeline.run_scenario(scenario_dict, enable_retrieval_eval=bool(scenario_dict.get("queries")))
             mode_results.append(res)
 
         # Store raw results for later breakdown
@@ -198,14 +202,22 @@ def run_evaluation(
     return report
 
 
-def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Any]) -> Dict[str, Any]:
     """Compute comprehensive metrics for a mode."""
     if len(mode_results) != len(scenarios):
         raise ValueError(f"mode_results length ({len(mode_results)}) does not match scenarios length ({len(scenarios)})")
 
+    # Convert Scenario objects to dicts if needed
+    scenario_dicts = []
+    for scen in scenarios:
+        if hasattr(scen, 'to_dict'):
+            scenario_dicts.append(scen.to_dict())
+        else:
+            scenario_dicts.append(scen)
+
     def _normalize_conflict_type(conflict_type: str) -> str:
         """Map detector conflict types to gold taxonomy."""
-        gold_types = {"compatible_extension", "mutually_exclusive", "none", "semantic_overlap", "stale_read_conflict"}
+        gold_types = {"compatible_extension", "mutually_exclusive", "none", "semantic_overlap", "stale_read_conflict", "counterfactual_temporal"}
         if conflict_type in gold_types:
             return conflict_type
         mapping = {
@@ -213,6 +225,8 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
             "semantic_duplicate": "semantic_overlap",
             "potential_contradiction": "mutually_exclusive",
             "concurrent_update_conflict": "mutually_exclusive",
+            "concurrent_update": "mutually_exclusive",
+            "temporal_inconsistency": "counterfactual_temporal",
         }
         return mapping.get(conflict_type, conflict_type)
 
@@ -247,10 +261,10 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
     # Conflict type distribution across decisions
     conflict_type_distribution = {}
 
-    for res, scen in zip(mode_results, scenarios):
+    for res, scen_dict in zip(mode_results, scenario_dicts):
         # Scenario-level conflict detection: did we detect any conflict?
         predicted_conflict_exists = res["metrics"]["num_conflicts"] > 0
-        gold_conflict_exists = scen.get("gold_conflict_exists", False)
+        gold_conflict_exists = scen_dict.get("gold_conflict_exists", False)
         if predicted_conflict_exists == gold_conflict_exists:
             conflict_detection_correct += 1
 
@@ -261,7 +275,7 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
             if result.get("conflict_detected", False):
                 predicted_type = _normalize_conflict_type(result.get("conflict_type", "none"))
                 break
-        gold_type = scen.get("gold_conflict_type", "none")
+        gold_type = scen_dict.get("gold_conflict_type", "none")
         if predicted_type == gold_type:
             conflict_type_correct += 1
 
@@ -279,7 +293,7 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
                 continue
 
             pred = ev.get("resolution_action", "append")
-            gold = scen.get("gold_resolution_action", "append")
+            gold = scen_dict.get("gold_resolution_action", "append")
             action_total += 1
             if pred == gold:
                 action_correct += 1
@@ -291,9 +305,9 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
     conflict_type_accuracy = conflict_type_correct / total_scenarios if total_scenarios else 0.0
 
     # Conflict detection metrics (precision/recall/F1) already computed
-    tp = sum(1 for r, s in zip(mode_results, scenarios) if s.get("gold_conflict_exists") and r["metrics"]["num_conflicts"] > 0)
-    fp = sum(1 for r, s in zip(mode_results, scenarios) if not s.get("gold_conflict_exists") and r["metrics"]["num_conflicts"] > 0)
-    fn = sum(1 for r, s in zip(mode_results, scenarios) if s.get("gold_conflict_exists") and r["metrics"]["num_conflicts"] == 0)
+    tp = sum(1 for r, s in zip(mode_results, scenario_dicts) if s.get("gold_conflict_exists") and r["metrics"]["num_conflicts"] > 0)
+    fp = sum(1 for r, s in zip(mode_results, scenario_dicts) if not s.get("gold_conflict_exists") and r["metrics"]["num_conflicts"] > 0)
+    fn = sum(1 for r, s in zip(mode_results, scenario_dicts) if s.get("gold_conflict_exists") and r["metrics"]["num_conflicts"] == 0)
     conflict_precision = tp / (tp + fp) if (tp + fp) else 0.0
     conflict_recall = tp / (tp + fn) if (tp + fn) else 0.0
     conflict_f1 = (
@@ -316,10 +330,10 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
     # Stale read handling accuracy (for scenarios with gold_conflict_type == "stale_read_conflict")
     stale_correct = 0
     stale_total = 0
-    for res, scen in zip(mode_results, scenarios):
-        if scen.get("gold_conflict_type") == "stale_read_conflict":
+    for res, scen_dict in zip(mode_results, scenario_dicts):
+        if scen_dict.get("gold_conflict_type") == "stale_read_conflict":
             stale_total += 1
-            gold_action = scen.get("gold_resolution_action")
+            gold_action = scen_dict.get("gold_resolution_action")
             # Find the first conflict decision (should be the stale read conflict)
             pred_action = None
             for dec in res.get("arbitration_decisions", []):
@@ -336,11 +350,11 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
     # Temporal update accuracy: for scenarios that are mutually exclusive and with ordered timestamps
     temporal_correct = 0
     temporal_total = 0
-    for res, scen in zip(mode_results, scenarios):
+    for res, scen_dict in zip(mode_results, scenario_dicts):
         # Check if scenario qualifies as temporal update scenario:
         # gold_conflict_type is "mutually_exclusive" and events are ordered (second event later than first)
-        if scen.get("gold_conflict_type") == "mutually_exclusive":
-            events = scen.get("ordered_events", [])
+        if scen_dict.get("gold_conflict_type") == "mutually_exclusive":
+            events = scen_dict.get("ordered_events", [])
             # Need at least two write proposals
             writes = [ev for ev in events if ev.get("event_type") == "write_proposal"]
             if len(writes) >= 2:
@@ -363,6 +377,72 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
                         temporal_correct += 1
     temporal_update_accuracy = temporal_correct / temporal_total if temporal_total else 0.0
 
+    # Counterfactual temporal accuracy (for scenarios with gold_conflict_type == "counterfactual_temporal")
+    counterfactual_correct = 0
+    counterfactual_total = 0
+    for res, scen_dict in zip(mode_results, scenario_dicts):
+        gold_type = scen_dict.get("gold_conflict_type", "none")
+        if gold_type == "counterfactual_temporal":
+            counterfactual_total += 1
+            gold_action = scen_dict.get("gold_resolution_action")
+            # Find the first conflict decision
+            pred_action = None
+            for dec in res.get("arbitration_decisions", []):
+                result = dec.get("result", {})
+                if result.get("conflict_detected", False):
+                    pred_action = dec.get("resolution_action", "append")
+                    break
+            if pred_action is None:
+                pred_action = "append"
+            if pred_action == gold_action:
+                counterfactual_correct += 1
+    counterfactual_accuracy = counterfactual_correct / counterfactual_total if counterfactual_total else 0.0
+
+    # Action Appropriateness Score (weighted by action correctness)
+    # overwrite: +1 (when correct), merge: +0.9, keep_multiple_versions: +0.6 (expensive), defer: +0.5 (fallback), reject: +1, append: -0.5 (when conflict exists)
+    action_weights = {
+        "overwrite": 1.0,
+        "merge": 0.9,
+        "keep_multiple_versions": 0.6,
+        "defer": 0.5,
+        "reject": 1.0,
+        "append": -0.5  # Penalty for missing conflict
+    }
+    appropriateness_sum = 0.0
+    appropriateness_total = 0
+    for res, scen_dict in zip(mode_results, scenario_dicts):
+        for dec in res.get("arbitration_decisions", []):
+            result = dec.get("result", {})
+            is_conflict = (
+                result.get("conflict_detected", False) or
+                result.get("conflict_type", "none") != "none" or
+                result.get("candidate_count", 0) > 0
+            )
+            pred_action = dec.get("resolution_action", "append")
+            gold_action = scen_dict.get("gold_resolution_action", "append")
+
+            # Check if prediction matches gold
+            correct = pred_action == gold_action
+            weight = action_weights.get(pred_action, 0.0)
+
+            if correct:
+                appropriateness_sum += weight
+            else:
+                # Penalize incorrect actions (use negative of weight or -1 for severe errors)
+                if is_conflict and pred_action == "append":
+                    appropriateness_sum -= 1.0  # Severe: missed conflict
+                else:
+                    appropriateness_sum -= 0.5  # Wrong action
+
+            appropriateness_total += 1
+
+    action_appropriateness_score = appropriateness_sum / appropriateness_total if appropriateness_total else 0.0
+
+    # Judge-free rate: scenarios that don't require defer (higher is better)
+    defer_count = sum(1 for r in mode_results for dec in r.get("arbitration_decisions", [])
+                     if dec.get("resolution_action") == "defer")
+    judge_free_rate = 1.0 - (defer_count / total_writes) if total_writes else 1.0
+
     # Final memory F1: compare final_visible_state vs gold_visible_shared_state_after_commit
     def extract_facts(state):
         facts = set()
@@ -376,8 +456,8 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
     total_gold = 0
     total_pred = 0
     total_correct = 0
-    for res, scen in zip(mode_results, scenarios):
-        gold_state = scen.get("gold_visible_shared_state_after_commit", [])
+    for res, scen_dict in zip(mode_results, scenario_dicts):
+        gold_state = scen_dict.get("gold_visible_shared_state_after_commit", [])
         pred_state = res.get("final_visible_state", [])
         gold_facts = extract_facts(gold_state)
         pred_facts = extract_facts(pred_state)
@@ -394,12 +474,12 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
     # Per-conflict-type action accuracy (conflict decisions only)
     per_type_correct = {}
     per_type_total = {}
-    for res, scen in zip(mode_results, scenarios):
-        gold_type = scen.get("gold_conflict_type", "none")
+    for res, scen_dict in zip(mode_results, scenario_dicts):
+        gold_type = scen_dict.get("gold_conflict_type", "none")
         for ev in res.get("arbitration_decisions", []):
             if _is_conflict_decision(ev):
                 pred = ev.get("resolution_action", "append")
-                gold = scen.get("gold_resolution_action", "append")
+                gold = scen_dict.get("gold_resolution_action", "append")
                 per_type_total[gold_type] = per_type_total.get(gold_type, 0) + 1
                 if pred == gold:
                     per_type_correct[gold_type] = per_type_correct.get(gold_type, 0) + 1
@@ -423,6 +503,7 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
         "conflict_recall": conflict_recall,
         "conflict_f1": conflict_f1,
         "action_accuracy": action_accuracy,
+        "action_appropriateness_score": action_appropriateness_score,
         "first_writes_skipped": first_write_total,
         "total_writes": total_writes,
         "total_conflicts": total_conflicts,
@@ -434,6 +515,8 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
         "stale_handling_accuracy": stale_handling_accuracy,
         "stale_events": stale_total,
         "temporal_update_accuracy": temporal_update_accuracy,
+        "counterfactual_accuracy": counterfactual_accuracy,
+        "judge_free_rate": judge_free_rate,
         "final_memory_f1": memory_f1,
         "avg_branch_count": avg_branch_count,
         "conflict_type_distribution": conflict_type_distribution,
@@ -443,12 +526,20 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[Di
 
 def _compute_per_type_breakdown(
     raw_results: Dict[str, List[Dict[str, Any]]],
-    scenarios: List[Dict[str, Any]]
+    scenarios: List[Any]
 ) -> Dict[str, Dict[str, float]]:
     """Breakdown action accuracy by scenario type using raw results."""
     breakdown = {}
+    # Convert Scenario objects to dicts if needed
+    scenario_dicts = []
+    for scen in scenarios:
+        if hasattr(scen, 'to_dict'):
+            scenario_dicts.append(scen.to_dict())
+        else:
+            scenario_dicts.append(scen)
+
     # Map scenario index to its type
-    idx_to_type = {i: s.get("scenario_type", "unknown") for i, s in enumerate(scenarios)}
+    idx_to_type = {i: s.get("scenario_type", "unknown") for i, s in enumerate(scenario_dicts)}
 
     for mode, results_list in raw_results.items():
         # Accumulate correct/total per scenario type
@@ -469,7 +560,7 @@ def _compute_per_type_breakdown(
                 if not is_conflict_decision:
                     continue
                 pred = ev.get("resolution_action", "append")
-                gold = scenarios[idx].get("gold_resolution_action", "append")
+                gold = scenario_dicts[idx].get("gold_resolution_action", "append")
                 type_total[st] = type_total.get(st, 0) + 1
                 if pred == gold:
                     type_correct[st] = type_correct.get(st, 0) + 1

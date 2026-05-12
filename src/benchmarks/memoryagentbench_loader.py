@@ -1,25 +1,28 @@
 """
 MemoryAgentBench adapter for Hugging Face dataset.
 
-Integrates the MemoryAgentBench dataset into the multi-agent memory conflict evaluation harness.
+Dataset: https://huggingface.co/datasets/ai-hyz/MemoryAgentBench
+Correct dataset ID: ai-hyz/MemoryAgentBench (not THUDM/MemoryAgentBench)
 
-Dataset: https://huggingface.co/datasets/THUDM/MemoryAgentBench
+Integrates the MemoryAgentBench dataset into the multi-agent memory conflict evaluation harness.
 """
 import json
-from typing import Dict, List, Any, Optional
+import re
+from typing import Dict, List, Any, Optional, Tuple
+from src.format import Scenario, MemoryEntry, Event, Query
 from src.benchmarks.generator_core import generate_scenario
 
 
-def load_memoryagentbench(subset: str = "all", num_samples: int = None) -> List[Dict[str, Any]]:
+def load_memoryagentbench(subset: str = "all", num_samples: int = None) -> List[Scenario]:
     """
     Load MemoryAgentBench from Hugging Face.
 
     Args:
-        subset: Which subset to load ("all", "conflict", "temporal", "update", etc.)
+        subset: Which subset to load ("all", "Accurate_Retrieval", "Test_Time_Learning", "Long_Range_Understanding", "Conflict_Resolution")
         num_samples: Maximum number of samples to load (None for all)
 
     Returns:
-        List of scenarios in the repository's benchmark format.
+        List of Scenario objects in ISF format.
     """
     try:
         from datasets import load_dataset
@@ -28,181 +31,380 @@ def load_memoryagentbench(subset: str = "all", num_samples: int = None) -> List[
         print("Please install: pip install datasets")
         return []
 
-    try:
-        # Try streaming to save memory
-        ds = load_dataset("THUDM/MemoryAgentBench", split="test", streaming=True)
-    except Exception as e:
-        print(f"Error loading MemoryAgentBench: {e}")
-        print("Streaming not available, falling back to regular load (may use more memory)...")
-        try:
-            ds = load_dataset("THUDM/MemoryAgentBench", split="test")
-        except Exception as e2:
-            print(f"Failed to load MemoryAgentBench: {e2}")
-            print("Make sure you have internet connection and the datasets library is properly installed.")
-            return []
+    # Correct dataset ID
+    dataset_name = "ai-hyz/MemoryAgentBench"
+
+    # Determine which splits to load
+    if subset == "all":
+        splits = ["Accurate_Retrieval", "Test_Time_Learning", "Long_Range_Understanding", "Conflict_Resolution"]
+    else:
+        splits = [subset]
 
     scenarios = []
-    for idx, item in enumerate(ds):
-        # Convert MemoryAgentBench format to repository format
-        scenario = _convert_memoryagentbench_item(item, idx, subset)
-        if scenario:
-            scenarios.append(scenario)
-        # Stop if we reached the sample limit
+    for split in splits:
+        try:
+            ds = load_dataset(dataset_name, split=split)
+        except Exception as e:
+            print(f"Warning: Could not load split '{split}': {e}")
+            continue
+
+        for idx, item in enumerate(ds):
+            scenario = _convert_memoryagentbench_item(item, split, idx)
+            if scenario:
+                scenarios.append(scenario)
+            if num_samples is not None and len(scenarios) >= num_samples:
+                break
         if num_samples is not None and len(scenarios) >= num_samples:
             break
 
+    print(f"Loaded {len(scenarios)} MemoryAgentBench scenarios (subset={subset})")
     return scenarios
 
 
-def _convert_memoryagentbench_item(item: Dict[str, Any], idx: int, subset_filter: str) -> Optional[Dict[str, Any]]:
-    """
-    Convert a MemoryAgentBench item to the repository's scenario format.
+def _parse_facts_from_context(context: str) -> List[Dict[str, Any]]:
+    """Parse facts from context string.
 
-    MemoryAgentBench item structure (expected):
-    - scenario_type: e.g., "conflict", "temporal", "update"
-    - agents: list of agent names
-    - events: list of events with agent_id, event_type, content/turn, timestamp
-    - query: question to answer after processing events
-    - gold_answer: correct answer
-    - gold_update_action: expected resolution action
-    - gold_state: expected final memory state
-
-    Returns:
-        Scenario dict compatible with repository evaluation harness.
+    Context format: "Here is a list of facts:\n0. Thomas Kyd was born in London.\n1. ..."
+    Returns list of fact dicts with raw_text and fact_id.
     """
-    scenario_type = item.get("scenario_type", "unknown")
-    if subset_filter != "all" and scenario_type != subset_filter:
+    facts = []
+    lines = context.split('\n')
+
+    for line in lines:
+        # Match pattern: "0. Thomas Kyd was born in London."
+        match = re.match(r'\s*\d+\.\s+(.+?)(?:\.|$)', line.strip())
+        if match:
+            fact_text = match.group(1).strip()
+            facts.append({
+                'raw_text': fact_text,
+                'fact_id': len(facts)
+            })
+
+    return facts
+
+
+def _extract_entity_and_predicate(fact_text: str) -> Tuple[str, str, str]:
+    """
+    Extract (entity, predicate_type, object) from fact text.
+    """
+    text = fact_text.strip()
+    if not text:
+        return "unknown", "raw_statement", text
+
+    # Same patterns as memab_adapter
+    verb_patterns = {
+        r'\b(was|is|are|were)\s+born\s+in\b': ('birth_place', 2),
+        r'\b(was|is|are|were)\s+born\s+at\b': ('birth_place', 2),
+        r'\b(died|passed away)\s+in\b': ('death_place', 2),
+        r'\blives\s+in\b': ('current_location', 1),
+        r'\bworks?\s+(?:in|at)\b': ('work_location', 1),
+        r'\bworks?\s+as\b': ('occupation', 1),
+        r'\bplays?\s+(?:for|with|at)\b': ('affiliation', 1),
+        r'\bfounded\s+in\b': ('founder_location', 1),
+        r'\bfounded\s+by\b': ('founder', -1),
+        r'\bauthored?\s+by\b': ('author', -1),
+        r'\bdirected?\s+by\b': ('director', -1),
+        r'\bmarried\s+to\b': ('spouse', 1),
+        r'\bcitizen\s+of\b': ('citizenship', 1),
+        r'\b(created|developed)\s+by\b': ('creator', -1),
+        r'\b(performed|sang)\s+by\b': ('performer', -1),
+        r'\bis\s+located\s+in\b': ('location', 2),
+        r'\bcapital\s+of\b': ('capital', 1),
+        r'\bspeaks\b': ('language', 1),
+    }
+
+    lower_text = text.lower()
+    import re
+    for pattern, (pred_type, entity_pos) in verb_patterns.items():
+        match = re.search(pattern, lower_text)
+        if match:
+            parts = text.split(match.group(0), 1)
+            before = parts[0].strip() if len(parts) > 1 else ""
+            after = parts[1].strip() if len(parts) > 1 else ""
+
+            entity = before if before else "Unknown"
+            if entity_pos == -1:
+                object_val = after
+            else:
+                object_val = after
+
+            return entity, pred_type, object_val
+
+    # Fallback
+    words = text.split()
+    if len(words) >= 3:
+        entity = ' '.join(words[:2])
+    else:
+        entity = "unknown"
+    return entity, "raw_statement", text
+
+
+def _detect_conflicts_in_facts(facts: List[Dict[str, Any]]) -> Tuple[bool, str, str]:
+    """
+    Analyze facts to detect conflicts.
+
+    Returns: (has_conflict, conflict_type, resolution_action)
+    """
+    if len(facts) < 2:
+        return False, "none", "append"
+
+    # Build simple subject-predicate groups
+    # Use heuristic to extract "subject predicate object" pattern
+    fact_groups = {}  # key: (subject_guess, predicate_type) -> list of fact indices
+
+    # Predicates that are typically mutually exclusive
+    mutually_exclusive_verbs = {
+        'born': 'birth_place',
+        'died': 'death_place',
+        'lives': 'current_location',
+        'works': 'work_location',
+        'plays': 'position',
+        'is': 'identity',
+        'founded': 'founder',
+        'author': 'author',
+        'director': 'director',
+        'ceo': 'ceo',
+        'chairperson': 'chairperson',
+        'married': 'spouse',
+        'citizen': 'citizenship',
+        'located': 'location',
+        'capital': 'capital',
+        'language': 'language',
+        'employed': 'employer',
+        'educated': 'education',
+    }
+
+    for fact in facts:
+        text = fact['raw_text'].lower()
+
+        # Try to extract subject and predicate using verb patterns
+        subject_guess = None
+        predicate_type = None
+        object_val = None
+        subject_key = None  # Initialize
+
+        # Look for key verbs
+        for verb, pred_type in mutually_exclusive_verbs.items():
+            if verb in text:
+                # Extract subject (text before verb)
+                parts = text.split(verb, 1)
+                before_verb = parts[0].strip()
+                # Subject is typically last noun phrase before verb
+                subject_guess = before_verb.split()[-3:]  # Last few words
+                subject_key = ' '.join(subject_guess)
+
+                # Extract object (text after verb)
+                if len(parts) > 1:
+                    after_verb = parts[1].strip(' .,!?;:')
+                    # First few words as object
+                    object_val = ' '.join(after_verb.split()[:5])
+
+                predicate_type = pred_type
+                break
+
+        if subject_key and predicate_type:
+            key = (subject_key, predicate_type)
+            if key not in fact_groups:
+                fact_groups[key] = []
+            fact_groups[key].append({
+                'fact_idx': fact['fact_id'],
+                'object': object_val,
+                'full_text': fact['raw_text']
+            })
+
+    # Check for conflicts: same subject+predicate with different objects
+    conflict_count = 0
+    conflict_details = []
+
+    for key, entries in fact_groups.items():
+        if len(entries) > 1:
+            # Check if objects differ
+            objects = [e['object'].lower() if e['object'] else '' for e in entries]
+            unique_objects = set(objects)
+            if len(unique_objects) > 1:
+                conflict_count += 1
+                conflict_details.append({
+                    'subject_predicate': key,
+                    'entries': entries
+                })
+
+    if conflict_count > 0:
+        # Determine primary conflict type
+        # Most MemoryAgentBench conflicts are mutually exclusive facts
+        return True, "mutually_exclusive", "overwrite"
+
+    # Also check for semantic conflicts (similar but contradictory statements)
+    # For now, if many facts (>50), likely some semantic overlap
+    if len(facts) > 50:
+        return True, "semantic_overlap", "merge"
+
+    return False, "none", "append"
+
+
+def _convert_memoryagentbench_item(item: Dict[str, Any], split: str, idx: int) -> Optional[Scenario]:
+    """
+    Convert a MemoryAgentBench item to ISF Scenario.
+
+    The dataset has:
+    - context: string with numbered facts
+    - questions: list of questions
+    - answers: list of answers
+    - metadata: optional
+    """
+    context = item.get("context", "")
+    if not context:
         return None
 
-    agents = item.get("agents", ["agent_a", "agent_b"])
-    events = item.get("events", [])
+    # Parse facts from context
+    facts = _parse_facts_from_context(context)
+    if not facts:
+        return None
 
-    # Convert events to ordered_events format
+    # Detect conflicts
+    has_conflict, conflict_type, resolution_action = _detect_conflicts_in_facts(facts)
+
+    # Create agents (alternating)
+    num_agents = 2
+    agents = [f"agent_{i}" for i in range(num_agents)]
+
+    # Create ordered events (each fact as write proposal)
     ordered_events = []
-    for ev in events:
-        event_type = ev.get("event_type", "write_proposal")
-        agent_id = ev.get("agent_id", "agent_a")
-        content = ev.get("content", "")
-        timestamp = ev.get("timestamp", 0.0)
+    base_timestamp = 1000.0
+    time_step = 10.0
 
-        # Parse content into proposal if it's a write event
-        if event_type == "write_proposal":
-            # MemoryAgentBench may have structured content
-            # We'll parse it into subject, predicate, object_val
-            # For now, assume content is a simple text that we parse into a claim
-            proposal = _parse_memory_content(content, agent_id)
-            ordered_events.append({
-                "step": len(ordered_events) + 1,
-                "agent_id": agent_id,
-                "event_type": "write_proposal",
-                "proposal": proposal,
-                "timestamp": timestamp,
-                "read_snapshot_time": timestamp  # Assume read at same time for simplicity
-            })
-        elif event_type == "read":
-            # Include read events
-            ordered_events.append({
-                "step": len(ordered_events) + 1,
-                "agent_id": agent_id,
-                "event_type": "read",
-                "query": ev.get("query", ""),
-                "timestamp": timestamp
-            })
+    for i, fact in enumerate(facts):
+        agent_id = agents[i % num_agents]
+        raw_text = fact['raw_text']
 
-    # Determine gold values
-    gold_conflict_exists = item.get("gold_conflict_exists", len([e for e in events if e.get("event_type") == "write_proposal"]) > 1)
-    gold_conflict_type = item.get("gold_conflict_type", "none")
-    gold_resolution_action = item.get("gold_update_action", "append")
+        # Extract entity as subject
+        entity, predicate, object_val = _extract_entity_and_predicate(raw_text)
+        subject = entity[:100] if entity else f"fact_{fact['fact_id']}"
 
-    gold_state = item.get("gold_state", [])
-    gold_reconciled_memory_state = gold_state
-    gold_visible_shared_state_after_commit = gold_state
+        event = Event(
+            step=i,
+            agent_id=agent_id,
+            event_type="write_proposal",
+            timestamp=base_timestamp + (i * time_step),
+            proposal={
+                'subject': subject,
+                'predicate': predicate,
+                'object_val': object_val,
+                'confidence': 0.9,
+                'provenance': 'memoryagentbench'
+            }
+        )
+        ordered_events.append(event)
 
-    # Add queries for downstream QA evaluation
-    query = item.get("query")
-    gold_answer = item.get("gold_answer")
+    # Create queries from questions
     queries = []
-    if query and gold_answer:
-        queries.append({
-            "query_text": query,
-            "gold_answers": [gold_answer] if isinstance(gold_answer, str) else gold_answer,
-            "expected_retrieval_style": "best"
-        })
+    questions = item.get("questions", [])
+    answers = item.get("answers", [])
 
-    scenario = generate_scenario(
-        scenario_id=f"memoryagentbench_{subset_filter}_{idx}",
-        scenario_type=scenario_type,
+    # Ensure lists
+    if not isinstance(questions, list):
+        questions = [questions] if questions else []
+    if not isinstance(answers, list):
+        answers = [answers] if answers else []
+
+    for q, a in zip(questions, answers):
+        if q:  # Only add if question exists
+            query = Query(
+                query_text=str(q),
+                gold_answers=[str(a)] if not isinstance(a, list) else [str(x) for x in a],
+                expected_retrieval_style="best"
+            )
+            queries.append(query)
+
+    # Build gold memory state based on conflict type
+    gold_reconciled_memory_state = []
+    gold_visible_shared_state_after_commit = []
+
+    # Extract entity for each fact
+    fact_entities = []
+    for fact in facts:
+        entity, predicate, object_val = _extract_entity_and_predicate(fact['raw_text'])
+        fact_entities.append((entity, predicate, object_val))
+
+    if has_conflict and conflict_type == "mutually_exclusive":
+        # For mutually exclusive: only latest active for each conflicting entity-predicate
+        # Track latest write per (entity, predicate)
+        latest_by_key = {}
+        for i, (entity, predicate, object_val) in enumerate(fact_entities):
+            key = (entity, predicate)
+            latest_by_key[key] = i  # Will end up with last index
+
+        for i, (fact, (entity, predicate, object_val)) in enumerate(zip(facts, fact_entities)):
+            agent_id = agents[i % num_agents]
+            subject = entity[:100] if entity else f"fact_{fact['fact_id']}"
+
+            # Determine if this is the latest for its key
+            key = (entity, predicate)
+            is_latest = (i == latest_by_key.get(key, i))
+
+            status = "active" if is_latest else "superseded"
+
+            mem = MemoryEntry(
+                subject=subject,
+                predicate=predicate,
+                object_val=object_val,
+                status=status,
+                confidence=0.9,
+                provenance="memoryagentbench",
+                timestamp=base_timestamp + (i * time_step),
+                agent_id=agent_id
+            )
+            gold_reconciled_memory_state.append(mem)
+            if status == "active":
+                gold_visible_shared_state_after_commit.append(mem)
+    else:
+        # All facts active
+        for i, fact in enumerate(facts):
+            agent_id = agents[i % num_agents]
+            entity, predicate, object_val = _extract_entity_and_predicate(fact['raw_text'])
+            subject = entity[:100] if entity else f"fact_{fact['fact_id']}"
+
+            mem = MemoryEntry(
+                subject=subject,
+                predicate=predicate,
+                object_val=object_val,
+                status="active",
+                confidence=0.9,
+                provenance="memoryagentbench",
+                timestamp=base_timestamp + (i * time_step),
+                agent_id=agent_id
+            )
+            gold_reconciled_memory_state.append(mem)
+            gold_visible_shared_state_after_commit.append(mem)
+
+    scenario = Scenario(
+        scenario_id=f"memoryagentbench_{split}_{idx}",
         agents=agents,
         ordered_events=ordered_events,
-        gold_conflict_exists=gold_conflict_exists,
-        gold_conflict_type=gold_conflict_type,
-        gold_resolution_action=gold_resolution_action,
+        gold_conflict_exists=has_conflict,
+        gold_conflict_type=conflict_type,
+        gold_resolution_action=resolution_action,
         gold_reconciled_memory_state=gold_reconciled_memory_state,
         gold_visible_shared_state_after_commit=gold_visible_shared_state_after_commit,
-        description=f"MemoryAgentBench item {idx}: {scenario_type}",
-        agent_profiles=None,  # Could be added if dataset provides agent metadata
+        scenario_type=f"mab_{split.lower()}",
+        description=f"MemoryAgentBench {split} sample {idx}: {len(facts)} facts, {len(queries)} queries",
         queries=queries,
-        base_timestamp=item.get("base_timestamp", 1000.0)
+        base_timestamp=base_timestamp
     )
 
     return scenario
 
 
-def _parse_memory_content(content: str, agent_id: str) -> Dict[str, Any]:
-    """
-    Parse memory content into a structured proposal.
-
-    MemoryAgentBench content format can vary. We need to extract:
-    - subject
-    - predicate
-    - object_val
-    - confidence (if available)
-    - provenance (if available)
-
-    Simple heuristic: split by commas or use LLM extraction.
-    For now, use a simple rule-based parser.
-    """
-    # Simple parsing: "subject predicate object" or JSON-like
-    text = content.strip()
-
-    # Try to parse as JSON
-    if text.startswith('{') and text.endswith('}'):
-        try:
-            data = json.loads(text)
-            return {
-                "subject": data.get("subject", "user"),
-                "predicate": data.get("predicate", "status"),
-                "object_val": data.get("object", text),
-                "confidence": data.get("confidence", 0.8),
-                "provenance": data.get("provenance", "explicit")
-            }
-        except json.JSONDecodeError:
-            pass
-
-    # Simple heuristic parsing (very basic)
-    # This should be enhanced based on actual MemoryAgentBench format
-    parts = text.split(maxsplit=2)
-    if len(parts) >= 3:
-        subject = parts[0]
-        predicate = parts[1]
-        object_val = parts[2]
-    else:
-        subject = "user"
-        predicate = "info"
-        object_val = text
-
-    return {
-        "subject": subject,
-        "predicate": predicate,
-        "object_val": object_val,
-        "confidence": 0.8,
-        "provenance": "explicit"
-    }
-
-
 if __name__ == "__main__":
     # Test loading
-    scenarios = load_memoryagentbench(subset="conflict")
-    print(f"Loaded {len(scenarios)} MemoryAgentBench scenarios")
-    if scenarios:
-        print(json.dumps(scenarios[0], indent=2))
+    print("Testing MemoryAgentBench loader...")
+    for subset in ["Conflict_Resolution", "all"]:
+        scenarios = load_memoryagentbench(subset=subset, num_samples=2)
+        print(f"\nSubset '{subset}': loaded {len(scenarios)} scenarios")
+        if scenarios:
+            s = scenarios[0]
+            print(f"  Sample ID: {s.scenario_id}")
+            print(f"  Type: {s.scenario_type}")
+            print(f"  Events: {len(s.ordered_events)}")
+            print(f"  Facts: {len(s.gold_reconciled_memory_state)}")
+            print(f"  Conflict: {s.gold_conflict_exists}, type={s.gold_conflict_type}")
+            print(f"  Queries: {len(s.queries)}")

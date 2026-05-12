@@ -49,28 +49,14 @@ COPY docker-entrypoint.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # Accept Gemma license terms (for downloading Gemma models)
-# Users should provide their own HF token via --hf-token flag or environment variable
-RUN echo "Note: Models require accepting license on Hugging Face"
-RUN echo "Using Qwen models by default (publicly available)"
+# Note: Models are only downloaded when using real transformer agents with --use-dummy flag not set.
+# Default runs with dummy agents, no model downloads needed.
 
 # Default agent models (can be overridden via environment variables)
 ENV AGENT1_MODEL=Qwen/Qwen2.5-3B-Instruct
 ENV AGENT2_MODEL=Qwen/Qwen2.5-7B-Instruct
 ENV AGENT1_RELIABILITY=0.85
 ENV AGENT2_RELIABILITY=0.75
-
-# Pre-download models during build to avoid runtime downloads
-# This requires HF_TOKEN to be passed as build arg
-ARG HF_TOKEN
-RUN if [ -n "$HF_TOKEN" ]; then \
-        echo "Pre-downloading models..." && \
-        python -c "from huggingface_hub import login; login(token='$HF_TOKEN')" && \
-        python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoTokenizer.from_pretrained('$AGENT1_MODEL'); AutoModelForCausalLM.from_pretrained('$AGENT1_MODEL', low_cpu_mem_usage=True)" && \
-        python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; AutoTokenizer.from_pretrained('$AGENT2_MODEL'); AutoModelForCausalLM.from_pretrained('$AGENT2_MODEL', low_cpu_mem_usage=True)" && \
-        echo "Models downloaded successfully!"; \
-    else \
-        echo "HF_TOKEN not provided during build, models will be downloaded at runtime."; \
-    fi
 
 # Expose port for potential monitoring (optional)
 EXPOSE 8080
@@ -79,6 +65,8 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import sys; sys.exit(0)" || exit 1
 
-# Default command runs the agent comparison benchmark
+# Default command runs the unified benchmark runner
+# Fast test with dummy agents (default):
+#   Uses rule-based agents, no heavy model downloads
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
-CMD ["python", "run_agent_memory_comparison.py", "--num-scenarios", "10"]
+CMD ["python", "main.py", "--benchmark", "memae", "--max-scenarios", "10", "--use-dummy"]

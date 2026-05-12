@@ -3,16 +3,16 @@
 
 arbitration:
   weights:
-    confidence: 0.4
-    provenance: 0.3
+    confidence: 0.5
+    provenance: 0.25
     recency: 0.2
-    authority: 0.1
+    authority: 0.05
   recency_half_life: 3600.0  # seconds
 
 thresholds:
-  overwrite_margin: 0.12             # Minimum score difference to prefer overwrite
-  keep_multiple_versions_margin: 0.08 # Score margin too close -> keep both
-  defer_below_score: 0.40            # New entry score below this -> defer
+  overwrite_margin: 0.05             # Minimum score difference to prefer overwrite (aggressive)
+  keep_multiple_versions_margin: 0.02 # Score margin too close -> keep both (very aggressive)
+  defer_below_score: 0.30            # New entry score below this -> defer (lowered)
   semantic_duplicate: 0.95           # Cosine similarity threshold for exact duplicate
   semantic_overlap: 0.70             # Threshold for significant overlap
   contradiction_low_similarity: 0.30 # Below this similarity, consider contradiction

@@ -1,6 +1,7 @@
 import json
 import time
 from typing import Dict, Any, List
+from dataclasses import asdict
 
 from src.memory.shared_memory_store import SharedMemoryStore
 from src.agents.agent_runtime import AgentRuntime
@@ -60,10 +61,24 @@ class MultiAgentPipeline:
             with open(self.store.persistence_path, "w", encoding="utf-8") as f:
                 f.write("")
 
-        agents = self._build_agents(scenario.get("agents", []))
+        # Handle both Scenario objects and dicts
+        if hasattr(scenario, 'agents'):
+            agents_list = scenario.agents
+            events_list = scenario.ordered_events
+            queries_list = scenario.queries
+            scenario_id = scenario.scenario_id
+            gold_visible = scenario.gold_visible_shared_state_after_commit
+        else:
+            agents_list = scenario.get("agents", [])
+            events_list = scenario.get("ordered_events", [])
+            queries_list = scenario.get("queries", [])
+            scenario_id = scenario.get("scenario_id")
+            gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
+
+        agents = self._build_agents(agents_list)
 
         logs = {
-            "scenario_id": scenario.get("scenario_id"),
+            "scenario_id": scenario_id,
             "mode": self.mode,
             "agent_reads": [],
             "write_proposals": [],
@@ -75,12 +90,27 @@ class MultiAgentPipeline:
         }
 
         # Process events
-        for ev in scenario.get("ordered_events", []):
-            aid = ev.get("agent_id")
+        for ev in events_list:
+            # Handle both Event objects and dicts
+            if hasattr(ev, 'agent_id'):
+                aid = ev.agent_id
+                ev_step = ev.step
+                ev_type = ev.event_type
+                ev_proposal = ev.proposal
+                ev_query = ev.query
+                ev_read_snapshot_time = ev.read_snapshot_time
+            else:
+                aid = ev.get("agent_id")
+                ev_step = ev.get("step")
+                ev_type = ev.get("event_type")
+                ev_proposal = ev.get("proposal", {})
+                ev_query = ev.get("query")
+                ev_read_snapshot_time = ev.get("read_snapshot_time")
+
             if aid not in agents:
                 continue
 
-            if ev.get("event_type") == "read":
+            if ev_type == "read":
                 snapshot = agents[aid].read()
                 logs["agent_reads"].append({
                     "step": ev.get("step"),
@@ -88,19 +118,25 @@ class MultiAgentPipeline:
                     "snapshot": snapshot,
                 })
 
-            if ev.get("event_type") == "write_proposal":
-                proposal = ev.get("proposal", {})
+            if ev_type == "write_proposal":
+                proposal = ev_proposal
                 logs["write_proposals"].append({
-                    "step": ev.get("step"),
+                    "step": ev_step,
                     "agent_id": aid,
                     "proposal": proposal,
                 })
 
+                # Get read_snapshot_time, default to current time if None
+                raw_snapshot = ev_read_snapshot_time
+                read_snapshot_time = float(raw_snapshot) if raw_snapshot is not None else time.time()
+
+                # Get the event timestamp for proper ordering
+                event_timestamp = ev.get("timestamp", read_snapshot_time)
+
                 if self.mode == "conflict_aware":
-                    read_snapshot_time = float(ev.get("read_snapshot_time", time.time()))
-                    scenario_id = scenario.get("scenario_id")
                     result = self.conflict_writer.write(
-                        proposal, agent_id=aid, read_snapshot_time=read_snapshot_time, scenario_id=scenario_id
+                        proposal, agent_id=aid, read_snapshot_time=read_snapshot_time,
+                        scenario_id=scenario_id, event_timestamp=event_timestamp
                     )
                 elif self.mode == "lww":
                     result = self.lww_writer.write(proposal, agent_id=aid)
@@ -109,29 +145,29 @@ class MultiAgentPipeline:
 
                 if result.get("conflict_detected"):
                     logs["detected_conflicts"].append({
-                        "step": ev.get("step"),
+                        "step": ev_step,
                         "agent_id": aid,
                         "conflict_type": result.get("conflict_type"),
                     })
 
                 logs["arbitration_decisions"].append({
-                    "step": ev.get("step"),
+                    "step": ev_step,
                     "agent_id": aid,
                     "resolution_action": result.get("resolution_action", result.get("action")),
                     "result": result,
                 })
 
                 # Optional retrieval evaluation
-                if enable_retrieval_eval and scenario.get("queries"):
+                if enable_retrieval_eval and queries_list:
                     visible = [r.to_dict() for r in self.store.get_all_visible()]
-                    for query_info in scenario["queries"]:
+                    for query_info in queries_list:
                         query_text = query_info["query_text"]
                         gold_answers = query_info["gold_answers"]
                         retrieved = self._retrieve_for_eval(visible, query_text, k=5)
                         retrieved_objs = [r.get("object_val") for r in retrieved]
                         recall = len(set(retrieved_objs) & set(gold_answers)) / len(gold_answers) if gold_answers else 0.0
                         logs["retrieval_results"].append({
-                            "step": ev.get("step"),
+                            "step": ev_step,
                             "query": query_text,
                             "retrieved": retrieved_objs,
                             "gold": gold_answers,
@@ -158,9 +194,13 @@ class MultiAgentPipeline:
         scored.sort(key=lambda x: x[1], reverse=True)
         return [m for m, _ in scored[:k]]
 
-    def _compute_scenario_metrics(self, scenario: Dict[str, Any], logs: Dict[str, Any]) -> Dict[str, Any]:
+    def _compute_scenario_metrics(self, scenario: Any, logs: Dict[str, Any]) -> Dict[str, Any]:
         """Compute metrics for this scenario."""
-        gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
+        # Handle both Scenario objects and dicts
+        if hasattr(scenario, 'gold_visible_shared_state_after_commit'):
+            gold_visible = [asdict(m) for m in scenario.gold_visible_shared_state_after_commit]
+        else:
+            gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
         final_visible = logs["final_visible_state"]
 
         # Normalize states for comparison

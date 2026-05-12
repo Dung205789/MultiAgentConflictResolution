@@ -31,11 +31,13 @@ services:
     working_dir: /app
     # Override command as needed:
     # Default: run with dummy agents (fast test)
-    # command: ["python", "run_agent_memory_comparison.py", "--num-scenarios", "10", "--use-dummy"]
+    # command: ["python", "main.py", "--benchmark", "memae", "--max-scenarios", "10", "--use-dummy"]
+    # For specific benchmark:
+    # command: ["python", "main.py", "--benchmark", "all", "--max-scenarios", "50", "--use-dummy"]
     # For real models:
-    # command: ["python", "run_agent_memory_comparison.py", "--num-scenarios", "35"]
+    # command: ["python", "main.py", "--benchmark", "memae", "--max-scenarios", "35"]
     # Or specify custom models:
-    # command: ["python", "run_agent_memory_comparison.py", "--num-scenarios", "35", "--agent1-model", "Qwen/Qwen2.5-3B-Instruct", "--agent2-model", "Qwen/Qwen2.5-7B-Instruct"]
+    # command: ["python", "main.py", "--benchmark", "memae", "--max-scenarios", "35", "--agent1-model", "Qwen/Qwen2.5-3B-Instruct", "--agent2-model", "Qwen/Qwen2.5-7B-Instruct"]
     networks:
       - benchmark-network
 

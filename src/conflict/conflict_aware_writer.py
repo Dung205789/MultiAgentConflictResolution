@@ -80,6 +80,7 @@ class ConflictAwareWriter:
             "recall_boost_gamma": 0.1,
         })
 
+
     def _load_config(self, config_path: str) -> Dict[str, Any]:
         """Load arbitration configuration from YAML file."""
         if not HAVE_YAML:
@@ -99,6 +100,8 @@ class ConflictAwareWriter:
                 if config is None:
                     config = {}
                 print(f"Loaded arbitration config from {config_path}")
+                # DEBUG: Log thresholds
+                thresholds = config.get("thresholds", {})
                 return config
         except FileNotFoundError:
             print(f"Warning: Config file not found at {config_path}, using defaults")
@@ -220,6 +223,7 @@ class ConflictAwareWriter:
         proposal: Dict[str, Any],
         candidates: List[Dict[str, Any]],
         scenario_id: Optional[str] = None,
+        proposal_timestamp: float = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """
         Enhanced arbitration logic with context weights, uncertainty, and history tracking.
@@ -243,7 +247,13 @@ class ConflictAwareWriter:
 
         # Duplicate handling
         if conflict_type in ["exact_duplicate", "semantic_duplicate"]:
-            return "reject", {"reason": f"{conflict_type}_detected", "details": conflict_details}
+            action = "reject"
+            reason = "duplicate_detected" if conflict_type == "exact_duplicate" else "semantic_duplicate_detected"
+            return action, {
+                "reason": reason,
+                "conflict_type": conflict_type,
+                "details": conflict_details,
+            }
 
         # Get the latest candidate for comparison
         latest = candidates[-1] if candidates else {}
@@ -254,7 +264,10 @@ class ConflictAwareWriter:
         # Score both the proposal and the latest candidate
         proposal_scored = dict(proposal)
         proposal_scored["agent_authority"] = float(proposal.get("agent_authority", 0.5))
-        proposal_scored["timestamp"] = time.time()
+        # Use the actual proposal timestamp for recency calculation
+        if proposal_timestamp is None:
+            proposal_timestamp = time.time()
+        proposal_scored["timestamp"] = proposal_timestamp
 
         new_scores = self._score_memory(proposal_scored, recency_ref, context_weights)
         old_scores = self._score_memory(latest, recency_ref, context_weights) if latest else {"total": 0.0, "uncertainty": 1.0}
@@ -283,82 +296,162 @@ class ConflictAwareWriter:
 
         # Stale read conflict handling
         if conflict_type == "stale_read_conflict":
-            # Factor in uncertainty: high uncertainty in old entry favors overwrite
-            old_uncertainty = old_scores.get("uncertainty", 0.0)
-            effective_margin = margin + (old_uncertainty * 0.1)
+            # Stale read is an agent error - the agent wrote based on outdated information
+            # Default: reject the write (agent should re-read)
+            # Only defer if there are exceptional circumstances (e.g., time travel detected)
+            stale_info = conflict_details.get("stale_info", {})
+            reason = stale_info.get("reason", "")
 
-            # If the new entry has significantly higher confidence, overwrite despite staleness
-            if effective_margin > self.arbitration_thresholds.get("overwrite_margin", 0.15):
+            # Check for temporal anomalies that might warrant deferral
+            if "temporal_anomaly" in reason or "out_of_order" in reason:
+                # Defer for manual review of timing issues
+                action = "defer"
+                return action, {
+                    "reason": "temporal_anomaly_stale_read_needs_audit",
+                    "new_scores": new_scores,
+                    "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
+                    "stale_info": stale_info,
+                }
+            else:
+                # Normal stale read - reject (agent should re-read)
+                action = "reject"
+                return action, {
+                    "reason": "stale_read_rejected_agent_should_reread",
+                    "new_scores": new_scores,
+                    "old_scores": old_scores,
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
+                    "stale_info": stale_info,
+                }
+
+        # Concurrent update handling - simultaneous writes, favor the newer entry
+        if conflict_type == "concurrent_update":
+            prop_ts = proposal_timestamp
+            latest_ts = latest.get("timestamp", 0) if latest else 0
+
+
+            # For concurrent updates, the newer entry should win (last-write-wins)
+            if prop_ts > latest_ts:
                 action = "overwrite"
                 return action, {
-                    "reason": "high_confidence_despite_staleness",
+                    "reason": "newer_timestamp_wins_concurrent_update",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
-                    "margin": margin,
-                    "effective_margin": effective_margin,
-                    "uncertainty": new_scores.get("uncertainty", 0.0),
-                }
-            # Otherwise, defer to manual review
-            action = "defer"
-            return action, {
-                "reason": "stale_read_requires_review",
-                "new_scores": new_scores,
-                "old_scores": old_scores,
-                "margin": margin,
-                "uncertainty": new_scores.get("uncertainty", 0.0),
-            }
-
-        # Semantic overlap handling - good candidate for merging
-        if conflict_type == "semantic_overlap":
-            # Special case: if both values are JSON objects, always merge
-            if conflict_details.get("json_mergeable"):
-                action = "merge"
-                return action, {
-                    "reason": "json_objects_mergeable",
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
-                    "uncertainty": new_scores.get("uncertainty", 0.0),
-                }
-            similarity = conflict_details.get("similarity", 0.0)
-            # High similarity but not duplicate - merge
-            if similarity >= 0.7:
-                action = "merge"
-                return action, {
-                    "reason": "high_semantic_overlap_suitable_for_merge",
-                    "similarity": similarity,
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
-                    "uncertainty": new_scores.get("uncertainty", 0.0),
-                }
-            # Moderate similarity - keep both if confidence is similar
-            elif abs(confidence_margin) < self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08):
-                action = "keep_multiple_versions"
-                return action, {
-                    "reason": "moderate_overlap_similar_confidence",
-                    "similarity": similarity,
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
-                    "uncertainty": new_scores.get("uncertainty", 0.0),
-                }
-            # Otherwise, prefer the higher confidence one
-            elif confidence_margin > 0:
-                action = "overwrite"
-                return action, {
-                    "reason": "higher_confidence_moderate_overlap",
-                    "similarity": similarity,
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
                     "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
             else:
+                # Proposal is not newer - could be out-of-order or stale
+                # If timestamps are very close and scores are close, could keep both
+                margin = new_scores["total"] - old_scores["total"]
+                keep_margin = self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08)
+                if abs(margin) < keep_margin:
+                    action = "keep_multiple_versions"
+                    return action, {
+                        "reason": "concurrent_similar_scores_not_newer_keep_both",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "margin": margin,
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+                else:
+                    action = "reject"
+                    return action, {
+                        "reason": "older_proposal_not_newer_reject",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "margin": margin,
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+
+        # Counterfactual temporal conflict - newer info contradicts older in wrong order
+        if conflict_type == "counterfactual_temporal":
+            # Check if new entry is actually newer (corrective) or older (erroneous)
+            prop_ts = proposal_timestamp
+            latest_ts = latest.get("timestamp", 0)
+
+            if prop_ts > latest_ts:
+                # Newer info is correcting the old - overwrite with confidence check
+                if margin > -self.arbitration_thresholds.get("overwrite_margin", 0.15):
+                    action = "overwrite"
+                    return action, {
+                        "reason": "newer_temporal_correction_overwrite",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+                else:
+                    # Newer but low confidence - keep both for review
+                    action = "keep_multiple_versions"
+                    return action, {
+                        "reason": "newer_low_confidence_keep_both",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+            else:
+                # Old info is newer - the "new" entry is actually outdated
+                # Reject it
                 action = "reject"
                 return action, {
-                    "reason": "lower_confidence_moderate_overlap",
-                    "similarity": similarity,
+                    "reason": "out_of_order_proposal_is_older_reject",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
                     "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
+
+        # Temporal inconsistency (legacy) - merge into counterfactual_temporal
+        if conflict_type == "temporal_inconsistency":
+            # Treat as counterfactual_temporal for backward compatibility
+            # Use the same logic above
+            prop_ts = proposal_timestamp
+            latest_ts = latest.get("timestamp", 0)
+
+            if prop_ts > latest_ts:
+                if margin > -self.arbitration_thresholds.get("overwrite_margin", 0.15):
+                    action = "overwrite"
+                    return action, {
+                        "reason": "newer_temporal_corrective_overwrite",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+                else:
+                    action = "keep_multiple_versions"
+                    return action, {
+                        "reason": "newer_but_lower_confidence_keep_both",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+            else:
+                action = "defer"
+                return action, {
+                    "reason": "temporal_order_anomaly_requires_review",
+                    "new_scores": new_scores,
+                    "old_scores": old_scores,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
+                }
+
+        # Semantic overlap handling - should merge overlapping information
+        if conflict_type == "semantic_overlap":
+            # For semantic overlap, the appropriate action is to merge the values
+            # The detector already determined there is significant overlap
+            similarity = conflict_details.get("similarity", 0.0)
+            action = "merge"
+            return action, {
+                "reason": "semantic_overlap_merge",
+                "similarity": similarity,
+                "new_scores": new_scores,
+                "old_scores": old_scores,
+                "uncertainty": new_scores.get("uncertainty", 0.0),
+            }
 
         # Compatible extension - keep both versions
         if conflict_type == "compatible_extension":
@@ -370,53 +463,114 @@ class ConflictAwareWriter:
                 "uncertainty": new_scores.get("uncertainty", 0.0),
             }
 
-        # Mutually exclusive or potential contradiction
-        if conflict_type in ["mutually_exclusive", "potential_contradiction"]:
-            # Factor in uncertainty: high uncertainty favors the newer entry
+        # Potential contradiction - uncertain if truly conflicting
+        if conflict_type == "potential_contradiction":
+            # Low similarity but different values - could be unrelated or contradictory
+            # Use uncertainty to guide: high uncertainty in either → defer
             new_uncertainty = new_scores.get("uncertainty", 0.0)
             old_uncertainty = old_scores.get("uncertainty", 0.0)
-            uncertainty_adjustment = (old_uncertainty - new_uncertainty) * 0.1
-            effective_margin = margin + uncertainty_adjustment
+            avg_uncertainty = (new_uncertainty + old_uncertainty) / 2
 
-            # If new entry has significantly higher confidence, overwrite
-            if effective_margin > self.arbitration_thresholds.get("overwrite_margin", 0.15):
-                action = "overwrite"
+            prop_ts = proposal_timestamp
+            latest_ts = latest.get("timestamp", 0)
+            overwrite_thresh = self.arbitration_thresholds.get("overwrite_margin", 0.15)
+            keep_margin = self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08)
+
+
+            if avg_uncertainty > 0.6:
+                action = "defer"
                 return action, {
-                    "reason": "higher_confidence_contradiction",
+                    "reason": "high_uncertainty_potential_contradiction_needs_review",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
-                    "margin": margin,
-                    "effective_margin": effective_margin,
                     "uncertainty": new_uncertainty,
+                    "old_uncertainty": old_uncertainty,
                 }
-            # If similar confidence, use recency to break tie for mutually_exclusive
-            elif abs(effective_margin) < self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08):
-                if conflict_type == "mutually_exclusive":
+            else:
+                # Low uncertainty - treat as essentially a conflict
+                # If proposal is newer and margin is not significantly negative, overwrite
+                if margin > 0:
                     action = "overwrite"
                     return action, {
-                        "reason": "mutually_exclusive_newer_info_overwrites",
+                        "reason": "confidence_win_potential_contradiction",
                         "new_scores": new_scores,
                         "old_scores": old_scores,
+                        "margin": margin,
                         "uncertainty": new_uncertainty,
                     }
-                else:  # potential_contradiction
-                    action = "keep_multiple_versions"
+                elif abs(margin) < keep_margin:
+                    # Very close - if proposal is newer, overwrite; else keep both
+                    if prop_ts > latest_ts:
+                        action = "overwrite"
+                        return action, {
+                            "reason": "similar_scores_newer_wins_potential_contradiction",
+                            "new_scores": new_scores,
+                            "old_scores": old_scores,
+                            "uncertainty": new_uncertainty,
+                        }
+                    else:
+                        action = "keep_multiple_versions"
+                        return action, {
+                            "reason": "similar_scores_not_newer_keep_both",
+                            "new_scores": new_scores,
+                            "old_scores": old_scores,
+                            "uncertainty": new_uncertainty,
+                        }
+                else:
+                    # Negative margin (proposal lower) and not close
+                    action = "reject"
                     return action, {
-                        "reason": "contradictory_similar_confidence",
+                        "reason": "lower_confidence_potential_contradiction_reject",
                         "new_scores": new_scores,
                         "old_scores": old_scores,
-                        "contradiction_type": conflict_type,
+                        "margin": margin,
                         "uncertainty": new_uncertainty,
                     }
-            # If lower confidence, reject
-            else:
-                action = "reject"
+
+        # Mutually exclusive - definitive conflict, prioritize newer information (last-write-wins)
+        if conflict_type == "mutually_exclusive":
+            prop_ts = proposal_timestamp
+            latest_ts = latest.get("timestamp", 0) if latest else 0
+
+
+            # For mutually exclusive facts, the newer entry should win
+            if prop_ts > latest_ts:
+                action = "overwrite"
                 return action, {
-                    "reason": "lower_confidence_contradiction",
+                    "reason": "newer_timestamp_wins_mutually_exclusive",
                     "new_scores": new_scores,
                     "old_scores": old_scores,
-                    "margin": margin,
-                    "uncertainty": new_uncertainty,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
+                }
+            elif prop_ts == latest_ts:
+                # Exact same timestamp - use confidence to break tie
+                margin = new_scores["total"] - old_scores["total"]
+                if margin > 0:
+                    action = "overwrite"
+                    return action, {
+                        "reason": "same_timestamp_higher_score",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "margin": margin,
+                    }
+                else:
+                    action = "reject"
+                    return action, {
+                        "reason": "same_timestamp_not_higher_score_reject",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "margin": margin,
+                    }
+            else:
+                # Older proposal - reject (stale write)
+                action = "reject"
+                return action, {
+                    "reason": "older_proposal_stale_reject",
+                    "new_scores": new_scores,
+                    "old_scores": old_scores,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
                 }
 
         # Default case - defer to manual review
@@ -510,20 +664,24 @@ class ConflictAwareWriter:
             else:
                 # Try to perform a structured merge if possible
                 try:
-                    # Check if both values are JSON objects
-                    latest_json = json.loads(latest_obj) if latest_obj.startswith("{") else None
-                    new_json = json.loads(new_obj) if new_obj.startswith("{") else None
-
-                    if isinstance(latest_json, dict) and isinstance(new_json, dict):
+                    # Attempt to parse both as JSON (objects or arrays)
+                    latest_parsed = json.loads(latest_obj)
+                    new_parsed = json.loads(new_obj)
+                    if isinstance(latest_parsed, dict) and isinstance(new_parsed, dict):
                         # Merge JSON objects
-                        merged = {**latest_json, **new_json}
+                        merged = {**latest_parsed, **new_parsed}
                         entry.object_val = json.dumps(merged)
-                    elif isinstance(latest_json, list) and isinstance(new_json, list):
-                        # Merge lists with deduplication
-                        merged = list(set(latest_json + new_json))
+                    elif isinstance(latest_parsed, list) and isinstance(new_parsed, list):
+                        # Merge JSON arrays with deduplication, preserving order
+                        seen = set(latest_parsed)
+                        merged = list(latest_parsed)
+                        for item in new_parsed:
+                            if item not in seen:
+                                merged.append(item)
+                                seen.add(item)
                         entry.object_val = json.dumps(merged)
                     else:
-                        # Fall back to text concatenation with separator
+                        # Mismatched types or non-container JSON, fallback to concatenation
                         entry.object_val = f"{latest_obj} | {new_obj}"
                 except (json.JSONDecodeError, TypeError):
                     # Fall back to text concatenation with separator
@@ -564,7 +722,14 @@ class ConflictAwareWriter:
                 "review_priority": "high" if conflict_type in ["mutually_exclusive", "stale_read_conflict"] else "medium",
             })
 
-    def write(self, proposal: Dict[str, Any], agent_id: str, read_snapshot_time: float, scenario_id: Optional[str] = None) -> Dict[str, Any]:
+    def write(
+        self,
+        proposal: Dict[str, Any],
+        agent_id: str,
+        read_snapshot_time: float,
+        scenario_id: Optional[str] = None,
+        event_timestamp: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """
         Write a proposal to the memory store with conflict awareness.
 
@@ -573,18 +738,22 @@ class ConflictAwareWriter:
             agent_id: ID of the agent making the proposal
             read_snapshot_time: When the agent read the memory before making this proposal
             scenario_id: Optional scenario context for dynamic weight adjustment
+            event_timestamp: The timestamp of the write event. If None, uses current time.
 
         Returns:
             Result of the write operation
         """
+        # Determine the timestamp for this proposal
+        proposal_timestamp = event_timestamp if event_timestamp is not None else time.time()
+
         candidates = self._retrieve_candidates(proposal)
         conflict_type, conflict_details = detect_conflict_type(
             proposal, candidates, read_snapshot_time, self.staleness_detector, mode=self.mode
         )
 
-        # Arbitrate to decide action (with scenario context)
+        # Arbitrate to decide action (with scenario context and explicit timestamp)
         action, arbitration_details = self._arbitrate(
-            conflict_type, conflict_details, proposal, candidates, scenario_id
+            conflict_type, conflict_details, proposal, candidates, scenario_id, proposal_timestamp
         )
 
         # Commit arbitration history if tracking is enabled
@@ -609,6 +778,9 @@ class ConflictAwareWriter:
 
         # Build and propose the new entry
         entry = self._build_entry(proposal, agent_id, candidates)
+        # Set the entry's timestamp to the actual event time (not system creation time)
+        entry.timestamp = proposal_timestamp
+        entry.event_time = proposal_timestamp
 
         # Add conflict metadata to the entry
         if entry.arbitration_metadata is None:
