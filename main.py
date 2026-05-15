@@ -5,7 +5,7 @@ Main entry point for multi-agent memory conflict resolution evaluation.
 This unified runner supports:
 - Multiple benchmarks (MemAE, MemoryAgentBench, LoCoMo, custom)
 - All writer modes (conflict_aware, lww, naive)
-- Fast mode (dummy agents) and slow mode (real models)
+- Adapter-structured fast mode and optional model-based re-extraction
 - Comprehensive evaluation with detailed metrics
 
 Usage examples:
@@ -21,23 +21,20 @@ Usage examples:
   # Run with custom benchmark file
   python main.py --benchmark custom --custom-path data/my_benchmark.jsonl
 
-  # Fast mode with dummy agents (no heavy models)
+  # Fast benchmark mode using adapter-structured proposals
   python main.py --benchmark real_conflicts --use-dummy --max-scenarios 10
 
-  # Run with real transformer models
+  # Re-extract benchmark facts with local transformer models
   python main.py --benchmark real_conflicts --agent1-model Qwen/Qwen2.5-3B-Instruct --agent2-model Qwen/Qwen2.5-7B-Instruct
 
   # Run LoCoMo benchmark
-  python main.py --benchmark lococo --max-scenarios 20
-
-  # Run adversarial (synthetic, for ablation only)
-  python main.py --benchmark adversarial --max-scenarios 100
+  python main.py --benchmark locomo --max-scenarios 20
 """
 import argparse
 import json
 import sys
 import os
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Dict, Any, List
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,10 +43,71 @@ from src.evaluation.run_evaluation import run_evaluation_with_scenarios
 from src.benchmarks.unified_loader import load_benchmark, save_scenarios_to_jsonl
 
 
+def resolve_execution_device(preference: str) -> str:
+    """Resolve requested runtime device into `cpu` or `cuda`."""
+    if preference in {"cpu", "cuda"}:
+        return preference
+
+    try:
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
+    """Translate CLI agent flags into a concrete execution configuration."""
+    if args.use_dummy and (args.agent1_model or args.agent2_model):
+        raise ValueError("`--use-dummy` cannot be combined with `--agent1-model` or `--agent2-model`.")
+
+    use_model_reextract = bool(args.agent1_model or args.agent2_model)
+    proposal_source = "agent_extract" if use_model_reextract else "structured"
+    strict_agent_execution = use_model_reextract
+    resolved_device = resolve_execution_device(args.device)
+
+    agent_configs = {
+        "__slot_0__": {
+            "role": "primary",
+            "reliability": args.agent1_reliability,
+            "runtime_mode": "research_strict" if use_model_reextract else "debug_fallback",
+        },
+        "__slot_1__": {
+            "role": "secondary",
+            "reliability": args.agent2_reliability,
+            "runtime_mode": "research_strict" if use_model_reextract else "debug_fallback",
+        },
+    }
+
+    if use_model_reextract:
+        agent_configs["__slot_0__"].update({
+            "model_type": "transformer",
+            "model_name": args.agent1_model or "Qwen/Qwen2.5-1.5B-Instruct",
+            "device": resolved_device,
+        })
+        agent_configs["__slot_1__"].update({
+            "model_type": "transformer",
+            "model_name": args.agent2_model or args.agent1_model or "Qwen/Qwen2.5-1.5B-Instruct",
+            "device": resolved_device,
+        })
+    else:
+        agent_configs["__slot_0__"]["model_type"] = "structured"
+        agent_configs["__slot_1__"]["model_type"] = "structured"
+
+    return {
+        "proposal_source": proposal_source,
+        "strict_agent_execution": strict_agent_execution,
+        "agent_configs": agent_configs,
+        "device": resolved_device,
+        "mode_label": "dummy_structured" if args.use_dummy or not use_model_reextract else "transformer_reextract",
+    }
+
+
 def run_evaluation_pipeline(
     scenarios: List[Any],
     benchmark_name: str,
-    output_dir: str = "reports"
+    output_dir: str = "reports",
+    execution_config: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
     """Run evaluation on scenarios with all writer modes."""
     os.makedirs(output_dir, exist_ok=True)
@@ -58,7 +116,8 @@ def run_evaluation_pipeline(
     report = run_evaluation_with_scenarios(
         scenarios=scenarios,
         benchmark_name=benchmark_name,
-        output_path=output_path
+        output_path=output_path,
+        execution_config=execution_config,
     )
 
     # Print summary
@@ -76,6 +135,26 @@ def run_evaluation_pipeline(
     return report
 
 
+def load_real_conflicts_bundle(max_scenarios: int = None) -> List[Any]:
+    """
+    Load the accepted conflict bundle used by `--benchmark real_conflicts`.
+    The bundle combines MemAE and MemoryAgentBench Conflict_Resolution.
+    """
+    if max_scenarios is None:
+        memae_limit = None
+        mab_limit = None
+    else:
+        memae_limit = max_scenarios // 2
+        mab_limit = max_scenarios - memae_limit
+
+    scenarios: List[Any] = []
+    if memae_limit is None or memae_limit > 0:
+        scenarios.extend(load_benchmark("memae", max_scenarios=memae_limit))
+    if mab_limit is None or mab_limit > 0:
+        scenarios.extend(load_benchmark("mab", subset="Conflict_Resolution", max_scenarios=mab_limit))
+    return scenarios
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Unified benchmark runner for multi-agent memory conflict resolution"
@@ -86,8 +165,8 @@ def main():
         "--benchmark",
         type=str,
         default="real_conflicts",
-        choices=["memae", "mab_conflict", "real_conflicts", "longmemeval", "safeflow", "mab", "lococo", "adversarial", "custom", "all"],
-        help="Benchmark to evaluate. 'real_conflicts' = MemAE + MAB_Conflict. 'mab_conflict' = only MAB Conflict_Resolution split. 'all' excludes adversarial."
+        choices=["memae", "mab_conflict", "real_conflicts", "longmemeval", "safeflow", "mab", "locomo", "lococo", "custom", "all"],
+        help="Benchmark to evaluate. `real_conflicts` = MemAE + MAB Conflict_Resolution. All exposed choices are accepted external benchmarks or user-provided custom data."
     )
     parser.add_argument(
         "--subset",
@@ -118,19 +197,19 @@ def main():
     parser.add_argument(
         "--use-dummy",
         action="store_true",
-        help="Use dummy agents instead of transformer models (fast mode)"
+        help="Fast accepted-benchmark mode: use adapter-structured proposals and apply reliability priors without model re-extraction"
     )
     parser.add_argument(
         "--agent1-model",
         type=str,
         default=None,
-        help="Model for agent 1 (Qwen2.5-3B-Instruct by default)"
+        help="Optional local transformer model for agent 1. When set, the runner re-extracts proposals from raw benchmark text."
     )
     parser.add_argument(
         "--agent2-model",
         type=str,
         default=None,
-        help="Model for agent 2 (Qwen2.5-7B-Instruct by default)"
+        help="Optional local transformer model for agent 2. When set, the runner re-extracts proposals from raw benchmark text."
     )
     parser.add_argument(
         "--agent1-reliability",
@@ -143,6 +222,13 @@ def main():
         type=float,
         default=0.75,
         help="Reliability for agent 2 (dummy mode only)"
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device for transformer agents. `auto` uses CUDA when available."
     )
 
     # Output options
@@ -160,31 +246,42 @@ def main():
     )
 
     args = parser.parse_args()
+    if args.benchmark == "lococo":
+        print("Warning: `lococo` is deprecated. Using `locomo` instead.")
+        args.benchmark = "locomo"
+
+    try:
+        execution_config = build_execution_config(args)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        return 1
 
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Determine which benchmarks to run
     benchmarks_to_run = []
-    if args.benchmark in ["memae", "real_conflicts", "all"]:
-        benchmarks_to_run.append(("memae", {}))
-    if args.benchmark in ["mab_conflict", "real_conflicts"]:
-        benchmarks_to_run.append(("mab", {"subset": "Conflict_Resolution"}))
+    if args.benchmark == "memae":
+        benchmarks_to_run.append({"report_name": "memae", "load_name": "memae", "extra_kwargs": {}})
+    if args.benchmark == "mab_conflict":
+        benchmarks_to_run.append({"report_name": "mab_conflict", "load_name": "mab", "extra_kwargs": {"subset": "Conflict_Resolution"}})
+    if args.benchmark == "real_conflicts":
+        benchmarks_to_run.append({"report_name": "real_conflicts", "load_name": "real_conflicts", "extra_kwargs": {}})
     if args.benchmark in ["mab", "all"]:
-        benchmarks_to_run.append(("mab", {"subset": args.subset}))
+        benchmarks_to_run.append({"report_name": "mab", "load_name": "mab", "extra_kwargs": {"subset": args.subset}})
     if args.benchmark in ["longmemeval", "all"]:
-        benchmarks_to_run.append(("longmemeval", {"subset": args.subset}))
+        benchmarks_to_run.append({"report_name": "longmemeval", "load_name": "longmemeval", "extra_kwargs": {"subset": args.subset}})
     if args.benchmark in ["safeflow", "all"]:
-        benchmarks_to_run.append(("safeflow", {}))
-    if args.benchmark in ["lococo", "all"]:
-        benchmarks_to_run.append(("lococo", {"subset": args.subset}))
-    if args.benchmark == "adversarial":
-        benchmarks_to_run.append(("adversarial", {"num_scenarios": args.max_scenarios or 100, "difficulty": args.subset if args.subset != "all" else "medium"}))
+        benchmarks_to_run.append({"report_name": "safeflow", "load_name": "safeflow", "extra_kwargs": {}})
+    if args.benchmark in ["locomo", "all"]:
+        benchmarks_to_run.append({"report_name": "locomo", "load_name": "locomo", "extra_kwargs": {"subset": args.subset}})
+    if args.benchmark == "all":
+        benchmarks_to_run.insert(0, {"report_name": "memae", "load_name": "memae", "extra_kwargs": {}})
     if args.benchmark == "custom":
         if not args.custom_path:
             print("Error: --custom-path is required for custom benchmark")
             return 1
-        benchmarks_to_run.append(("custom", {"custom_path": args.custom_path}))
+        benchmarks_to_run.append({"report_name": "custom", "load_name": "custom", "extra_kwargs": {"custom_path": args.custom_path}})
 
     if not benchmarks_to_run:
         print("Error: No benchmarks selected")
@@ -192,7 +289,10 @@ def main():
 
     all_reports = {}
 
-    for benchmark_name, extra_kwargs in benchmarks_to_run:
+    for benchmark_spec in benchmarks_to_run:
+        benchmark_name = benchmark_spec["report_name"]
+        load_name = benchmark_spec["load_name"]
+        extra_kwargs = benchmark_spec["extra_kwargs"]
         print("\n" + "="*70)
         print(f"RUNNING BENCHMARK: {benchmark_name.upper()}")
         print("="*70)
@@ -211,7 +311,7 @@ def main():
             load_kwargs.update(extra_kwargs)
 
             # Handle custom benchmark
-            if benchmark_name == "custom":
+            if load_name == "custom":
                 custom_path = args.custom_path
                 scenarios = []
                 with open(custom_path, 'r', encoding='utf-8') as f:
@@ -221,8 +321,10 @@ def main():
                             scenarios.append(json.loads(line))
                 if args.max_scenarios:
                     scenarios = scenarios[:args.max_scenarios]
+            elif load_name == "real_conflicts":
+                scenarios = load_real_conflicts_bundle(max_scenarios=args.max_scenarios or args.num_samples)
             else:
-                scenarios = load_benchmark(benchmark_name, **load_kwargs)
+                scenarios = load_benchmark(load_name, **load_kwargs)
 
             if not scenarios:
                 print(f"No scenarios loaded for {benchmark_name}")
@@ -233,7 +335,7 @@ def main():
             # Optionally cache scenarios
             if args.cache_scenarios:
                 cache_path = f"{args.cache_scenarios}/{benchmark_name}_scenarios.jsonl"
-                if benchmark_name != "custom":
+                if load_name != "custom":
                     save_scenarios_to_jsonl(scenarios, cache_path)
                     print(f"  Cached to {cache_path}")
 
@@ -269,7 +371,8 @@ def main():
             report = run_evaluation_pipeline(
                 scenarios=scenarios,
                 benchmark_name=benchmark_name,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                execution_config=execution_config,
             )
             all_reports[benchmark_name] = report
 
@@ -287,7 +390,8 @@ def main():
     if all_reports:
         summary_path = os.path.join(args.output_dir, "summary.json")
         summary = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+            "execution": execution_config,
             "benchmarks": {
                 name: {
                     "num_scenarios": report.get("num_scenarios", 0) if isinstance(report, dict) else 0,

@@ -25,18 +25,23 @@ venv/
 *.zip
 .claude.zip
 requirements.zip
+kaggle/
+KAGGLE_SETUP.md
+kaggle_runner.ipynb
+.claude/
+.claudemcp-serversbenchmark-runner/
 
-# Local data (optional, keep if you want to include benchmark)
-# data/*.jsonl
-
-# Reports (generated)
-reports/*.json
-reports/*.txt
-reports/*.png
+# Local benchmark caches and generated outputs
+data/raw/
+data/processed/
+reports/
+dist/
+build/
 
 # Temporary files
 tmp_*
 *.log
+tmp_eval_*.jsonl
 
 # OS
 .DS_Store

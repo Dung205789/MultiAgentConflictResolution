@@ -34,7 +34,7 @@ memae_*.log
 cloudflared.exe
 
 # Reports (generated)
-reports/*.json
+reports/**
 !reports/.gitkeep
 
 # Data processed (keep only raw)
@@ -50,8 +50,22 @@ data/raw/
 
 # Model cache (download on demand)
 models/
+models_cache/
 .cache/
 .hf_cache/
+
+# Notebook and packaging artifacts
+.ipynb_checkpoints/
+dist/
+build/
+
+# Local distribution / staging
+kaggle/
+KAGGLE_SETUP.md
+kaggle_runner.ipynb
+
+# Local tool metadata
+.claudemcp-serversbenchmark-runner/
 
 # OS
 .DS_Store

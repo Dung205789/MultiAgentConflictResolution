@@ -2,7 +2,7 @@
 
 **Research project: Rule-based multi-agent memory conflict resolution under constraints.**
 
-This project implements a cost-effective multi-agent shared memory system that resolves conflicts using rule-based arbitration instead of LLMs. The system achieves near-SOTA performance while being 10-20x cheaper and faster.
+This project implements a cost-effective multi-agent shared memory system that resolves conflicts using rule-based arbitration instead of LLMs. The current focus is benchmark-aligned research on accepted external datasets, especially `MemoryAgentBench / Conflict_Resolution`, rather than synthetic headline metrics.
 
 ## Key Features
 
@@ -20,9 +20,9 @@ This project implements a cost-effective multi-agent shared memory system that r
 pip install -r requirements.txt
 ```
 
-**Note**: For full functionality, you may need optional dependencies for certain benchmarks. For pure rule-based evaluation (fast mode), only the core dependencies are needed.
+**Note**: For full functionality, you may need optional dependencies for certain benchmarks. Fast accepted-benchmark runs can reuse adapter-structured proposals without local model re-extraction.
 
-### Run Evaluation (Fast Mode - Recommended for Testing)
+### Run Evaluation (Fast Structured Mode - Recommended for Testing)
 
 ```bash
 # Test with 20 scenarios from MemAE
@@ -32,67 +32,82 @@ python main.py --benchmark memae --max-scenarios 20 --use-dummy
 python main.py --benchmark all --max-scenarios 50 --use-dummy
 ```
 
-### Run with Real Models (Slower but More Realistic)
+### Run with Real Models (Slower, Re-extracts From Raw Benchmark Text)
 
 ```bash
 # Set Hugging Face token if needed
 export HF_TOKEN="your_token_here"
 
-# Run with lightweight Qwen models
-python main.py --benchmark memae --max-scenarios 50 \
-  --agent1-model Qwen/Qwen2.5-3B-Instruct \
-  --agent2-model Qwen/Qwen2.5-7B-Instruct
+# Run with a Colab-friendly Qwen model
+python main.py --benchmark mab_conflict --max-scenarios 4 \
+  --agent1-model Qwen/Qwen2.5-1.5B-Instruct \
+  --agent2-model Qwen/Qwen2.5-1.5B-Instruct \
+  --device auto
 ```
 
 ---
 
 ## Running on Google Colab
 
-We provide `colab_runner.ipynb` for easy execution on Google Colab with GPU.
+We provide `colab_runner.ipynb` for a Colab-first workflow:
+
+- clone or pull the repo from GitHub
+- install the exact Python runtime dependencies
+- download Qwen on first transformer run
+- auto-download Hugging Face benchmarks that do not require local parquet files
+- save benchmark outputs under `reports/colab/`
 
 ### Setup Steps
 
-1. **Push code to GitHub** (if not already):
+1. **Push code to GitHub** (recommended):
    ```bash
    git add .
    git commit -m "Prepare for Colab"
    git push origin main
    ```
 
+   If you do not want to use GitHub, create a clean upload bundle locally:
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File .\scripts\export_clean_bundle.ps1
+   ```
+
 2. **Open Colab**:
    - Go to https://colab.research.google.com
    - Upload `colab_runner.ipynb`
-   - Or open from GitHub URL directly
+   - Or open it directly from your GitHub repo
 
 3. **Runtime Setup**:
    - Set Runtime type to **GPU (T4)**
-   - Mount your Google Drive when prompted
+   - Optional: set a Hugging Face token in Colab secrets as `HF_TOKEN`
 
 4. **Enter Configuration**:
-   - GitHub repo URL (your forked/copied repo)
-   - Model: Use `Qwen/Qwen2.5-1.5B-Instruct` for T4 (12GB)
-   - Scenarios: Start with 4, increase to 8 if time permits
+   - GitHub repo URL
+   - Branch name
+   - Benchmarks to run, for example: `mab_conflict,longmemeval,locomo,safeflow`
+   - Model: `Qwen/Qwen2.5-1.5B-Instruct`
+   - Scenarios: start with `1` or `2`
 
 5. **Run All Cells**:
-   - The notebook will auto-download models and data
-   - Real-time output streamed to notebook
-   - Results saved to `reports/` and auto-downloaded as ZIP
+   - The notebook clones or updates the repo automatically
+   - Qwen downloads on first transformer run
+   - Supported Hugging Face benchmarks download automatically
+   - Results are zipped at the end for download from Colab
 
 ### Important Notes for Colab
 
 - **Memory**: T4 GPU has ~12GB. Use 1.5B or 2.7B models. **Avoid 7B** (OOM).
 - **Time Limit**: Colab limits runtime to ~12 hours. Plan accordingly.
-- **Data**: MemAB parquet files must be uploaded to Drive manually (~100MB).
-- **MAB/LongMemEval**: Auto-downloaded from HuggingFace on first run.
+- **Automatic benchmarks**: `mab_conflict`, `longmemeval`, `locomo`, and `safeflow` can download on demand.
+- **Local-only benchmark**: `memae` still expects `data/raw/memab/Conflict_Resolution-00000-of-00001.parquet`.
 - **Model Cache**: Downloaded to `/root/.cache/huggingface` - persists across sessions.
 
 ### Troubleshooting Colab
 
 | Issue | Solution |
 |-------|----------|
-| CUDA OOM | Reduce `MAX_SCENARIOS` to 2, use phi-2 model |
-| Timeout | Run benchmarks separately: `--benchmark memae`, then `--benchmark mab_conflict` |
-| Data missing | Upload MemAB parquet to `data/raw/memab/` on Drive |
+| CUDA OOM | Reduce `MAX_SCENARIOS` to 1-2 and keep both agents on `Qwen/Qwen2.5-1.5B-Instruct` |
+| Timeout | Run the `smoke` preset first, then increase scenarios |
+| `memae` missing data | Switch to `mab_conflict` or upload the parquet file manually |
 
 ---
 
@@ -177,7 +192,6 @@ See `PROJECT_DOCUMENTATION.md` for full ISF specification.
 | **MemoryAgentBench** | HuggingFace (`ai-hyz/MemoryAgentBench`) | 8 (Conflict_Resolution split) | Diverse conflicts | Only Conflict_Resolution split suitable |
 | **Real Conflicts** | Combined | ~16 | Multiple | `--benchmark real_conflicts` (MemAE + MAB_Conflict) |
 | **LoCoMo** | HuggingFace (`Aman279/Locomo`) | 35 | Conversation memory | Multi-party, long dialogues |
-| **Adversarial** | Synthetic generator | Variable | All types | For ablation only (`--benchmark adversarial`) |
 
 **Note**: The core conflict resolution benchmarks are small (~16 scenarios total) because publicly available datasets with ground-truth conflict labels are limited. This is a research gap in the field.
 
@@ -189,26 +203,26 @@ See `PROJECT_DOCUMENTATION.md` for full ISF specification.
 python main.py [OPTIONS]
 
 Required:
-  --benchmark {memae,mab_conflict,real_conflicts,longmemeval,safeflow,mab,lococo,adversarial,custom,all}
+  --benchmark {memae,mab_conflict,real_conflicts,longmemeval,safeflow,mab,locomo,custom,all}
                 Which benchmark to evaluate
-                - real_conflicts: MemAE + MAB Conflict_Resolution (recommended for paper)
+                - real_conflicts: MemAE + MAB Conflict_Resolution (recommended accepted conflict bundle)
                 - mab_conflict: MemoryAgentBench Conflict_Resolution only
-                - all: All non-synthetic benchmarks (excludes adversarial)
+                - all: All accepted built-in benchmarks
 ```
 
 Data Options:
   --max-scenarios N      Limit scenarios (for testing)
   --num-samples N        Alias for max-scenarios
-  --subset SUBSET        Subset for benchmarks (default: "all" or "test")
+  --subset SUBSET        Subset for benchmarks (e.g. "Conflict_Resolution", "oracle", "s", "m", "test")
   --custom-path PATH     Path to custom JSONL (required for --benchmark custom)
   --cache-scenarios DIR  Save loaded scenarios as JSONL cache
 
 Agent Options:
-  --use-dummy            Use rule-based dummy agents (fast, no models)
-  --agent1-model NAME    Model for agent 1 (default: Qwen2.5-3B-Instruct)
-  --agent2-model NAME    Model for agent 2 (default: Qwen2.5-7B-Instruct)
-  --agent1-reliability X Reliability for agent 1 (dummy mode, 0.0-1.0)
-  --agent2-reliability X Reliability for agent 2 (dummy mode, 0.0-1.0)
+  --use-dummy            Use adapter-structured proposals with reliability priors; no model re-extraction
+  --agent1-model NAME    Local model for agent 1; enables strict raw-text re-extraction
+  --agent2-model NAME    Local model for agent 2; enables strict raw-text re-extraction
+  --agent1-reliability X Reliability prior for agent 1 (0.0-1.0)
+  --agent2-reliability X Reliability prior for agent 2 (0.0-1.0)
 
 Output Options:
   --output-dir DIR       Output directory (default: "reports")
@@ -226,8 +240,8 @@ python main.py --benchmark real_conflicts
 # Evaluate only MemoryAgentBench conflict subset
 python main.py --benchmark mab_conflict --max-scenarios 20
 
-# Run adversarial benchmark (synthetic, for ablation studies)
-python main.py --benchmark adversarial --max-scenarios 100
+# Run LongMemEval oracle subset
+python main.py --benchmark longmemeval --subset oracle --max-scenarios 20
 
 # Custom benchmark
 python main.py --benchmark custom --custom-path data/my_benchmark.jsonl
@@ -253,6 +267,11 @@ reports/
   "benchmark": "memae",
   "num_scenarios": 100,
   "timestamp": "2026-05-09T...",
+  "execution": {
+    "proposal_source": "structured",
+    "strict_agent_execution": false,
+    "mode_label": "dummy_structured"
+  },
   "results": {
     "conflict_aware": {
       "scenario_accuracy": 0.85,

@@ -1,24 +1,19 @@
-# Core dependencies (required)
 pyyaml>=6.0
 numpy>=1.24.0
 scikit-learn>=1.3.0
 tqdm>=4.66.0
 
-# Optional: For HuggingFace datasets
-# datasets>=2.14.0
+# Benchmark loading
+pandas>=2.0.0
+pyarrow>=14.0.0
+datasets>=2.14.0
 
-# Optional: For transformer-based agents
-# torch>=2.0.0
-# transformers>=4.35.0
-# sentencepiece>=0.1.99
-# safetensors>=0.4.0
-# huggingface-hub>=0.19.0
-# accelerate>=0.24.0
+# Local model execution
+transformers>=4.35.0
+accelerate>=0.24.0
+sentencepiece>=0.1.99
+safetensors>=0.4.0
+huggingface-hub>=0.19.0
 
-# Optional: For embedding-based semantic similarity
+# Optional: semantic similarity fallback
 # sentence-transformers>=2.2.0
-
-# Development (optional)
-# pytest>=7.0.0
-# black>=23.0.0
-# flake8>=6.0.0
