@@ -87,9 +87,17 @@ class MemoryEntry:
 class SharedMemoryStore:
     def __init__(self, persistence_path: str = "shared_memory.jsonl", enable_persistence: bool = True):
         self.records: List[MemoryEntry] = []
+        self._records_by_entity: Dict[str, List[MemoryEntry]] = {}
         self.persistence_path = persistence_path
         self.enable_persistence = enable_persistence and bool(persistence_path)
         self._load()
+
+    def _index_record(self, entry: MemoryEntry) -> None:
+        self._records_by_entity.setdefault(entry.entity_id, []).append(entry)
+
+    def reset(self) -> None:
+        self.records = []
+        self._records_by_entity = {}
 
     def _load(self):
         if not self.enable_persistence:
@@ -141,6 +149,7 @@ class SharedMemoryStore:
                     entry.arbitration_metadata = data.get("arbitration_metadata", entry.arbitration_metadata)
 
                     self.records.append(entry)
+                    self._index_record(entry)
         except FileNotFoundError:
             pass
 
@@ -154,6 +163,7 @@ class SharedMemoryStore:
     def propose_write(self, entry: MemoryEntry) -> str:
         """Tentative add (pre-conflict check)."""
         self.records.append(entry)
+        self._index_record(entry)
         self._save()
         return entry.memory_id
 
@@ -172,16 +182,25 @@ class SharedMemoryStore:
                    (agent_id is None or r.agent_id == agent_id)]
 
     def get_by_entity(self, entity_id: str) -> List[MemoryEntry]:
-        return [r for r in self.records if r.entity_id == entity_id]
+        return list(self._records_by_entity.get(entity_id, []))
+
+    def get_visible_candidates(self, subject: str, predicate: str) -> List[MemoryEntry]:
+        entity_id = f"{subject}_{predicate}"
+        candidates = [
+            r for r in self._records_by_entity.get(entity_id, [])
+            if r.status == "active" and r.visibility_state == "visible"
+        ]
+        candidates.sort(key=lambda x: ((x.committed_at or 0.0), x.version_id))
+        return candidates
 
     def get_version_chain(self, entity_id: str) -> List[MemoryEntry]:
-        chain = [r for r in self.records if r.entity_id == entity_id]
+        chain = list(self._records_by_entity.get(entity_id, []))
         chain.sort(key=lambda x: (x.version_id, x.committed_at or 0.0))
         return chain
 
     def get_active_versions(self, entity_id: str) -> List[MemoryEntry]:
         versions = [
-            r for r in self.records
+            r for r in self._records_by_entity.get(entity_id, [])
             if r.entity_id == entity_id
             and r.status == "active"
             and r.visibility_state == "visible"

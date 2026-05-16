@@ -91,44 +91,52 @@ def _extract_entity_and_predicate(fact_text: str) -> Tuple[str, str, str]:
     if not text:
         return "unknown", "raw_statement", text
 
-    # Same patterns as memab_adapter
-    verb_patterns = {
-        r'\b(was|is|are|were)\s+born\s+in\b': ('birth_place', 2),
-        r'\b(was|is|are|were)\s+born\s+at\b': ('birth_place', 2),
-        r'\b(died|passed away)\s+in\b': ('death_place', 2),
-        r'\blives\s+in\b': ('current_location', 1),
-        r'\bworks?\s+(?:in|at)\b': ('work_location', 1),
-        r'\bworks?\s+as\b': ('occupation', 1),
-        r'\bplays?\s+(?:for|with|at)\b': ('affiliation', 1),
-        r'\bfounded\s+in\b': ('founder_location', 1),
-        r'\bfounded\s+by\b': ('founder', -1),
-        r'\bauthored?\s+by\b': ('author', -1),
-        r'\bdirected?\s+by\b': ('director', -1),
-        r'\bmarried\s+to\b': ('spouse', 1),
-        r'\bcitizen\s+of\b': ('citizenship', 1),
-        r'\b(created|developed)\s+by\b': ('creator', -1),
-        r'\b(performed|sang)\s+by\b': ('performer', -1),
-        r'\bis\s+located\s+in\b': ('location', 2),
-        r'\bcapital\s+of\b': ('capital', 1),
-        r'\bspeaks\b': ('language', 1),
-    }
-
-    lower_text = text.lower()
-    import re
-    for pattern, (pred_type, entity_pos) in verb_patterns.items():
-        match = re.search(pattern, lower_text)
+    direct_patterns = [
+        (r"^The chairperson of (.+?) is (.+?)$", "chairperson"),
+        (r"^The director of (.+?) is (.+?)$", "director"),
+        (r"^The author of (.+?) is (.+?)$", "author"),
+        (r"^The chief executive officer of (.+?) is (.+?)$", "ceo"),
+        (r"^The capital of (.+?) is (.+?)$", "capital"),
+        (r"^The official language of (.+?) is (.+?)$", "official_language"),
+        (r"^The name of the current head of state in (.+?) is (.+?)$", "head_of_state"),
+        (r"^The Prime Minister of (.+?) is (.+?)$", "prime_minister"),
+        (r"^The headquarters of (.+?) is located in the city of (.+?)$", "headquarters_city"),
+        (r"^The univeristy where (.+?) was educated is (.+?)$", "educated_at"),
+        (r"^The university where (.+?) was educated is (.+?)$", "educated_at"),
+        (r"^The company that produced (.+?) is (.+?)$", "producer_company"),
+        (r"^The company that originally broadcasted (.+?) is (.+?)$", "original_broadcaster"),
+    ]
+    for pattern, predicate in direct_patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
         if match:
-            parts = text.split(match.group(0), 1)
-            before = parts[0].strip() if len(parts) > 1 else ""
-            after = parts[1].strip() if len(parts) > 1 else ""
+            return match.group(1).strip(), predicate, match.group(2).strip()
 
-            entity = before if before else "Unknown"
-            if entity_pos == -1:
-                object_val = after
-            else:
-                object_val = after
-
-            return entity, pred_type, object_val
+    subject_patterns = [
+        (r"^(.+?) is married to (.+?)$", "spouse"),
+        (r"^(.+?) is a citizen of (.+?)$", "citizenship"),
+        (r"^(.+?) is affiliated with the religion of (.+?)$", "religion"),
+        (r"^(.+?) is associated with the sport of (.+?)$", "sport"),
+        (r"^(.+?) plays the position of (.+?)$", "position"),
+        (r"^(.+?) was born in the city of (.+?)$", "birth_place"),
+        (r"^(.+?) died in the city of (.+?)$", "death_place"),
+        (r"^(.+?) was founded by (.+?)$", "founder"),
+        (r"^(.+?) was founded in the city of (.+?)$", "founder_location"),
+        (r"^(.+?) was created in the country of (.+?)$", "origin_country"),
+        (r"^(.+?) was performed by (.+?)$", "performer"),
+        (r"^(.+?) was created by (.+?)$", "creator"),
+        (r"^(.+?) is famous for (.+?)$", "known_for"),
+        (r"^(.+?) is located in the continent of (.+?)$", "location"),
+        (r"^(.+?) speaks the language of (.+?)$", "language"),
+        (r"^(.+?) is employed by (.+?)$", "employer"),
+        (r"^(.+?) worked in the city of (.+?)$", "work_location"),
+        (r"^(.+?) works in the field of (.+?)$", "occupation"),
+        (r"^(.+?)'s child is (.+?)$", "child"),
+        (r"^The type of music that (.+?) plays is (.+?)$", "music_type"),
+    ]
+    for pattern, predicate in subject_patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip(), predicate, match.group(2).strip()
 
     # Fallback
     words = text.split()
@@ -290,7 +298,8 @@ def _convert_memoryagentbench_item(item: Dict[str, Any], split: str, idx: int) -
                 'predicate': predicate,
                 'object_val': object_val,
                 'confidence': 0.9,
-                'provenance': 'memoryagentbench'
+                'provenance': 'memoryagentbench',
+                'raw_text': raw_text,
             }
         )
         ordered_events.append(event)

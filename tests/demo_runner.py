@@ -3,7 +3,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.pipeline.multi_agent_pipeline import MultiAgentPipeline, load_benchmark
+from src.benchmarks.unified_loader import load_benchmark
+from src.pipeline.multi_agent_pipeline import MultiAgentPipeline
 
 
 def run_demo(benchmark_path: str = "data/enhanced_multi_agent_benchmark.jsonl", n: int = 3):

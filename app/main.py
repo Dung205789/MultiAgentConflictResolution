@@ -10,25 +10,25 @@ This unified runner supports:
 
 Usage examples:
   # Run specific benchmark with default settings
-  python main.py --benchmark memae --max-scenarios 50
+  python app/main.py --benchmark memae --max-scenarios 50
 
   # Run real conflict scenarios (MemAE + MAB Conflict_Resolution)
-  python main.py --benchmark real_conflicts
+  python app/main.py --benchmark real_conflicts
 
   # Run MemoryAgentBench conflict subset only
-  python main.py --benchmark mab_conflict
+  python app/main.py --benchmark mab_conflict
 
   # Run with custom benchmark file
-  python main.py --benchmark custom --custom-path data/my_benchmark.jsonl
+  python app/main.py --benchmark custom --custom-path data/my_benchmark.jsonl
 
   # Fast benchmark mode using adapter-structured proposals
-  python main.py --benchmark real_conflicts --use-dummy --max-scenarios 10
+  python app/main.py --benchmark real_conflicts --use-dummy --max-scenarios 10
 
   # Re-extract benchmark facts with local transformer models
-  python main.py --benchmark real_conflicts --agent1-model Qwen/Qwen2.5-3B-Instruct --agent2-model Qwen/Qwen2.5-7B-Instruct
+  python app/main.py --benchmark real_conflicts --agent1-model Qwen/Qwen2.5-3B-Instruct --agent2-model Qwen/Qwen2.5-7B-Instruct
 
   # Run LoCoMo benchmark
-  python main.py --benchmark locomo --max-scenarios 20
+  python app/main.py --benchmark locomo --max-scenarios 20
 """
 import argparse
 import json
@@ -37,7 +37,8 @@ import os
 from datetime import datetime, UTC
 from typing import Dict, Any, List
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, PROJECT_ROOT)
 
 from src.evaluation.run_evaluation import run_evaluation_with_scenarios
 from src.benchmarks.unified_loader import load_benchmark, save_scenarios_to_jsonl

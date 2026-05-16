@@ -15,19 +15,21 @@ $rootFiles = @(
     ".env.example",
     ".gitignore",
     "Dockerfile",
-    "README.md",
-    "colab_runner.ipynb",
     "docker-compose.yml",
     "docker-entrypoint.sh",
-    "main.py",
     "requirements.txt"
 )
 
 $rootDirs = @(
+    "app",
     "configs",
+    "docs",
+    "kaggle",
+    "notebooks",
     "reports",
     "scripts",
-    "src"
+    "src",
+    "tests"
 )
 
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null

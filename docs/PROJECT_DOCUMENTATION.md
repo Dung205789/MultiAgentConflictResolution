@@ -2,7 +2,7 @@
 
 ## Overview
 
-This project implements a **rule-based multi-agent memory conflict resolution system** operating under constraints. The system avoids LLM dependencies for core arbitration logic, providing cost-effective solutions while maintaining competitive performance.
+This project implements a **rule-based multi-agent memory conflict resolution system** operating under constraints. The system avoids LLM dependencies for core arbitration logic, with current work focused on benchmark-aligned evaluation against accepted external datasets.
 
 ### Key Goals Achieved
 1. ✅ Rule-based conflict resolution (no LLM dependency for arbitration)
@@ -14,6 +14,11 @@ This project implements a **rule-based multi-agent memory conflict resolution sy
 ---
 
 ## Internal Standard Format (ISF)
+
+Validation note:
+- accepted external benchmarks are the primary research path
+- synthetic and legacy local benchmarks are not the headline evidence path
+- official-style QA evaluation is stronger evidence than local `state_match`
 
 All benchmark data is converted to a unified format defined in `src/format.py`.
 
@@ -193,7 +198,7 @@ context_weights:
 
 ---
 
-## Novel Contributions (vs SOTA as of May 2026)
+## Current Research Contributions
 
 ### 1. Dynamic Contextual Arbitration
 Unlike static weight approaches, this system supports **scenario-specific weight overrides**. Different conflict contexts (factual disputes, temporal updates, cross-agent merges) automatically adjust arbitration strategy.
@@ -233,24 +238,27 @@ Core arbitration runs without LLM dependencies:
 ### Single Entry Point: `main.py`
 
 ```bash
-# Run all benchmarks
+# Run all accepted built-in benchmarks
 python main.py --benchmark all --max-scenarios 100
 
 # Run specific benchmark
 python main.py --benchmark memae --max-scenarios 50
 
-# Run with custom output directory
-python main.py --benchmark longmemeval --output-dir reports/custom_run
+# Run LongMemEval oracle subset with custom output directory
+python main.py --benchmark longmemeval --subset oracle --output-dir reports/custom_run
 ```
 
 ### Command-Line Options
 
 | Option | Description |
 |--------|-------------|
-| `--benchmark` | One of: `memae`, `longmemeval`, `safeflow`, `all` |
+| `--benchmark` | One of: `memae`, `mab_conflict`, `real_conflicts`, `longmemeval`, `safeflow`, `mab`, `locomo`, `custom`, `all` |
 | `--max-scenarios` | Limit number of scenarios (for testing) |
+| `--subset` | Benchmark subset such as `Conflict_Resolution`, `oracle`, `s`, `m`, or `test` |
 | `--output-dir` | Output directory for reports (default: `reports/`) |
 | `--cache-scenarios` | Optional path to cache loaded scenarios as JSONL |
+| `--use-dummy` | Use adapter-structured proposals with reliability priors and no model re-extraction |
+| `--agent1-model`, `--agent2-model` | Re-extract facts from raw benchmark text with local transformer models |
 
 ### Output Structure
 
@@ -370,6 +378,12 @@ Cost: **~10-20x cheaper** than LLM-based arbitration (no LLM calls in critical p
 
 ## Development Notes
 
+Validation policy:
+- prefer accepted benchmark artifacts over synthetic or local-only metrics
+- treat `state_match` as an internal proxy, not official benchmark parity
+- require report artifacts for any claim of improvement
+- keep model-based re-extraction and adapter-structured runs clearly separated in report metadata
+
 ### Adding a New Benchmark
 
 1. Create adapter in `src/benchmarks/adapters/` implementing `convert_all_to_scenarios()`
@@ -385,28 +399,22 @@ Cost: **~10-20x cheaper** than LLM-based arbitration (no LLM calls in critical p
 ### Running Full Evaluation
 
 ```bash
-# Fast (dummy agents, all benchmarks)
+# Fast structured run on accepted benchmarks
 python main.py --benchmark all --max-scenarios 100
 
-# With real models
-python run_agent_memory_comparison.py \
-  --num-scenarios 100 \
+# With local transformer re-extraction
+python main.py --benchmark mab_conflict --max-scenarios 8 \
   --agent1-model Qwen/Qwen2.5-3B-Instruct \
   --agent2-model Qwen/Qwen2.5-7B-Instruct
 ```
 
 ---
 
-## Comparison to SOTA (May 2026)
+## Reporting Discipline
 
-| System | LLM Dependency | Cost | Conflict F1 | Notes |
-|--------|----------------|------|-------------|-------|
-| This project | Rule-based only | Low | 0.90+ | Contextual weights, uncertainty-aware |
-| LLM-arbitrated baselines | Heavy LLM use | High | 0.92-0.95 | Expensive, slow |
-| Simple LWW | None | Minimal | 0.40-0.60 | No semantic understanding |
-| Naive append | None | Minimal | 0.00 | Branch explosion |
-
-**Advantage**: Near-SOTA performance at fraction of the cost and latency.
+- Do not claim benchmark parity from local `state_match`.
+- Prefer accepted benchmark reports over synthetic or legacy local benchmarks.
+- Compare adapter-structured and model re-extraction runs only when the report metadata makes the execution mode explicit.
 
 ---
 

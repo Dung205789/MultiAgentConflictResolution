@@ -5,7 +5,7 @@ Runs conflict_aware, lww, and naive baselines on custom or MemoryAgentBench data
 import json
 import os
 import sys
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -32,7 +32,8 @@ def load_custom_benchmark(path: str) -> List[Dict[str, Any]]:
 def run_evaluation_with_scenarios(
     scenarios: List[Dict[str, Any]],
     benchmark_name: str = "custom",
-    output_path: str = "reports/evaluation_report.json"
+    output_path: str = "reports/evaluation_report.json",
+    execution_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run evaluation with pre-loaded scenarios.
@@ -47,6 +48,8 @@ def run_evaluation_with_scenarios(
     """
     print(f"Running evaluation on {len(scenarios)} scenarios from {benchmark_name}")
 
+    execution_config = dict(execution_config or {})
+
     # Run each writer type
     results = {}
     raw_results = {}  # Store raw results for per-type breakdown
@@ -57,6 +60,9 @@ def run_evaluation_with_scenarios(
             mode=mode,
             persistence_path=f"tmp_eval_{mode}.jsonl",
             enable_persistence=False,
+            agent_configs=execution_config.get("agent_configs"),
+            proposal_source=execution_config.get("proposal_source", "structured"),
+            strict_agent_execution=execution_config.get("strict_agent_execution", False),
         )
         mode_results = []
         scenario_iter = tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios)) if HAVE_TQDM else scenarios
@@ -76,6 +82,8 @@ def run_evaluation_with_scenarios(
         print(f"  Scenario accuracy: {results[mode]['scenario_accuracy']:.3f}")
         print(f"  Conflict F1: {results[mode]['conflict_f1']:.3f}")
         print(f"  Action accuracy: {results[mode]['action_accuracy']:.3f}")
+        if results[mode].get("qa_total", 0):
+            print(f"  QA exact match: {results[mode]['qa_exact_match']:.3f}")
 
     # Compute deltas
     deltas = {}
@@ -94,6 +102,7 @@ def run_evaluation_with_scenarios(
         "benchmark": benchmark_name,
         "num_scenarios": len(scenarios),
         "timestamp": _get_timestamp(),
+        "execution": execution_config,
         "results": results,
         "deltas": deltas,
         "per_scenario_type": _compute_per_type_breakdown(raw_results, scenarios),
@@ -112,7 +121,8 @@ def run_evaluation(
     benchmark_path: str = None,
     use_memoryagentbench: bool = False,
     mab_subset: str = "all",
-    output_path: str = "reports/evaluation_report.json"
+    output_path: str = "reports/evaluation_report.json",
+    execution_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run comprehensive evaluation.
@@ -142,6 +152,8 @@ def run_evaluation(
 
     print(f"Loaded {len(scenarios)} scenarios")
 
+    execution_config = dict(execution_config or {})
+
     # Run each writer type
     results = {}
     raw_results = {}  # Store raw results for per-type breakdown
@@ -151,6 +163,9 @@ def run_evaluation(
             mode=mode,
             persistence_path=f"tmp_eval_{mode}.jsonl",
             enable_persistence=False,
+            agent_configs=execution_config.get("agent_configs"),
+            proposal_source=execution_config.get("proposal_source", "structured"),
+            strict_agent_execution=execution_config.get("strict_agent_execution", False),
         )
         mode_results = []
         scenario_iter = tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios)) if HAVE_TQDM else scenarios
@@ -170,6 +185,8 @@ def run_evaluation(
         print(f"  Scenario accuracy: {results[mode]['scenario_accuracy']:.3f}")
         print(f"  Conflict F1: {results[mode]['conflict_f1']:.3f}")
         print(f"  Action accuracy: {results[mode]['action_accuracy']:.3f}")
+        if results[mode].get("qa_total", 0):
+            print(f"  QA exact match: {results[mode]['qa_exact_match']:.3f}")
 
     # Compute deltas
     deltas = {}
@@ -188,6 +205,7 @@ def run_evaluation(
         "benchmark": benchmark_name,
         "num_scenarios": len(scenarios),
         "timestamp": _get_timestamp(),
+        "execution": execution_config,
         "results": results,
         "deltas": deltas,
         "per_scenario_type": _compute_per_type_breakdown(raw_results, scenarios),
@@ -235,6 +253,8 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
         Detect whether a write decision corresponds to an actual conflict event.
         """
         result = decision.get("result", {})
+        if result.get("conflict_type") in {"exact_duplicate", "semantic_duplicate"}:
+            return False
         candidate_count = result.get("candidate_count")
         if candidate_count is not None:
             return candidate_count > 0
@@ -246,6 +266,7 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
     scenario_correct = sum(1 for r in mode_results if r["metrics"]["state_match"])
     total_writes = sum(r["metrics"]["num_writes"] for r in mode_results)
     total_conflicts = sum(r["metrics"]["num_conflicts"] for r in mode_results)
+    any_gold_conflicts = any(s.get("gold_conflict_exists", False) for s in scenario_dicts)
 
     # Action accuracy (only for events with conflict, i.e., candidate_count > 0)
     action_correct = 0
@@ -300,7 +321,7 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
             per_action[pred] = per_action.get(pred, 0) + 1
             per_action_gold[gold] = per_action_gold.get(gold, 0) + 1
 
-    action_accuracy = action_correct / action_total if action_total else 0.0
+    action_accuracy = action_correct / action_total if action_total else (0.0 if any_gold_conflicts else 1.0)
     conflict_detection_accuracy = conflict_detection_correct / total_scenarios if total_scenarios else 0.0
     conflict_type_accuracy = conflict_type_correct / total_scenarios if total_scenarios else 0.0
 
@@ -326,6 +347,24 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
                     retrieval_recall_sum += m["recall_at_k"]
                     retrieval_tasks += 1
     retrieval_recall_at_5 = retrieval_recall_sum / retrieval_tasks if retrieval_tasks else 0.0
+
+    qa_exact_matches = 0
+    qa_total = 0
+    qa_answered = 0
+    qa_hop_sum = 0
+    for r in mode_results:
+        qa_results = r.get("qa_results")
+        if qa_results:
+            for item in qa_results:
+                qa_total += 1
+                if item.get("predicted_answers"):
+                    qa_answered += 1
+                if item.get("exact_match", False):
+                    qa_exact_matches += 1
+                qa_hop_sum += int(item.get("hops", 0) or 0)
+    qa_exact_match = qa_exact_matches / qa_total if qa_total else 0.0
+    qa_answer_rate = qa_answered / qa_total if qa_total else 0.0
+    qa_avg_hops = qa_hop_sum / qa_total if qa_total else 0.0
 
     # Stale read handling accuracy (for scenarios with gold_conflict_type == "stale_read_conflict")
     stale_correct = 0
@@ -398,8 +437,10 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
                 counterfactual_correct += 1
     counterfactual_accuracy = counterfactual_correct / counterfactual_total if counterfactual_total else 0.0
 
-    # Action Appropriateness Score (weighted by action correctness)
-    # overwrite: +1 (when correct), merge: +0.9, keep_multiple_versions: +0.6 (expensive), defer: +0.5 (fallback), reject: +1, append: -0.5 (when conflict exists)
+    # Action Appropriateness Score (weighted by action correctness).
+    # Score only true conflict decisions so first writes do not distort the metric.
+    # overwrite: +1 (when correct), merge: +0.9, keep_multiple_versions: +0.6 (expensive),
+    # defer: +0.5 (fallback), reject: +1, append: -0.5 (when conflict exists)
     action_weights = {
         "overwrite": 1.0,
         "merge": 0.9,
@@ -412,12 +453,8 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
     appropriateness_total = 0
     for res, scen_dict in zip(mode_results, scenario_dicts):
         for dec in res.get("arbitration_decisions", []):
-            result = dec.get("result", {})
-            is_conflict = (
-                result.get("conflict_detected", False) or
-                result.get("conflict_type", "none") != "none" or
-                result.get("candidate_count", 0) > 0
-            )
+            if not _is_conflict_decision(dec):
+                continue
             pred_action = dec.get("resolution_action", "append")
             gold_action = scen_dict.get("gold_resolution_action", "append")
 
@@ -429,14 +466,16 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
                 appropriateness_sum += weight
             else:
                 # Penalize incorrect actions (use negative of weight or -1 for severe errors)
-                if is_conflict and pred_action == "append":
+                if pred_action == "append":
                     appropriateness_sum -= 1.0  # Severe: missed conflict
                 else:
                     appropriateness_sum -= 0.5  # Wrong action
 
             appropriateness_total += 1
 
-    action_appropriateness_score = appropriateness_sum / appropriateness_total if appropriateness_total else 0.0
+    action_appropriateness_score = (
+        appropriateness_sum / appropriateness_total if appropriateness_total else (0.0 if any_gold_conflicts else 1.0)
+    )
 
     # Judge-free rate: scenarios that don't require defer (higher is better)
     defer_count = sum(1 for r in mode_results for dec in r.get("arbitration_decisions", [])
@@ -503,6 +542,7 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
         "conflict_recall": conflict_recall,
         "conflict_f1": conflict_f1,
         "action_accuracy": action_accuracy,
+        "action_events": action_total,
         "action_appropriateness_score": action_appropriateness_score,
         "first_writes_skipped": first_write_total,
         "total_writes": total_writes,
@@ -512,6 +552,10 @@ def _compute_mode_metrics(mode_results: List[Dict[str, Any]], scenarios: List[An
         "action_distribution_gold": per_action_gold,
         "per_conflict_type_action_accuracy": per_type_accuracy,
         "retrieval_recall_at_5": retrieval_recall_at_5,
+        "qa_exact_match": qa_exact_match,
+        "qa_answer_rate": qa_answer_rate,
+        "qa_total": qa_total,
+        "qa_avg_hops": qa_avg_hops,
         "stale_handling_accuracy": stale_handling_accuracy,
         "stale_events": stale_total,
         "temporal_update_accuracy": temporal_update_accuracy,
@@ -577,8 +621,8 @@ def _compute_per_type_breakdown(
 
 def _get_timestamp():
     """Get current timestamp string."""
-    from datetime import datetime
-    return datetime.utcnow().isoformat() + "Z"
+    from datetime import datetime, UTC
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 if __name__ == "__main__":
