@@ -189,7 +189,15 @@ class TransformerAgent(LocalAgent):
             return f"[{self.agent_id}] Model not available: {prompt[:50]}..."
 
         try:
-            output = self.generator(prompt, max_new_tokens=max_new_tokens, do_sample=False)
+            output = self.generator(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                temperature=None,
+                top_p=None,
+                top_k=None,
+                return_full_text=True,
+            )
             return output[0]["generated_text"][len(prompt):].strip()
         except Exception as e:
             return f"[{self.agent_id}] Generation error: {e}"

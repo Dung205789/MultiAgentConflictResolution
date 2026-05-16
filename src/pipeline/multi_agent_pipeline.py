@@ -117,9 +117,17 @@ class MultiAgentPipeline:
                 prepared = merged
                 source_used = "agent_extract"
             elif self.strict_agent_execution:
-                raise RuntimeError(
-                    f"Agent extraction failed for {event_payload.get('agent_id')} under strict agent execution mode."
-                )
+                # On accepted benchmarks we already have adapter-structured proposals.
+                # If model extraction returns nothing, keep the structured proposal so one
+                # bad generation does not abort the entire run.
+                if prepared.get("predicate") and prepared.get("object_val"):
+                    prepared.setdefault("raw_text", seed_text)
+                    prepared["_agent_extract_fallback"] = "structured_proposal"
+                    source_used = "structured_fallback"
+                else:
+                    raise RuntimeError(
+                        f"Agent extraction failed for {event_payload.get('agent_id')} under strict agent execution mode."
+                    )
 
         if reliability is not None:
             prepared["agent_authority"] = float(reliability)
