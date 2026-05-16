@@ -57,6 +57,16 @@ def resolve_execution_device(preference: str) -> str:
         return "cpu"
 
 
+def detect_cuda_device_count() -> int:
+    """Return the number of visible CUDA devices."""
+    try:
+        import torch
+
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
 def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
     """Translate CLI agent flags into a concrete execution configuration."""
     if args.use_dummy and (args.agent1_model or args.agent2_model):
@@ -66,6 +76,12 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
     proposal_source = "agent_extract" if use_model_reextract else "structured"
     strict_agent_execution = use_model_reextract
     resolved_device = resolve_execution_device(args.device)
+    cuda_device_count = detect_cuda_device_count() if resolved_device == "cuda" else 0
+    primary_device = "cpu"
+    secondary_device = "cpu"
+    if resolved_device == "cuda":
+        primary_device = "cuda:0"
+        secondary_device = "cuda:1" if cuda_device_count > 1 else "cuda:0"
 
     agent_configs = {
         "__slot_0__": {
@@ -84,12 +100,14 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
         agent_configs["__slot_0__"].update({
             "model_type": "transformer",
             "model_name": args.agent1_model or "Qwen/Qwen2.5-1.5B-Instruct",
-            "device": resolved_device,
+            "device": primary_device,
+            "quantization_mode": "4bit" if resolved_device == "cuda" else "none",
         })
         agent_configs["__slot_1__"].update({
             "model_type": "transformer",
             "model_name": args.agent2_model or args.agent1_model or "Qwen/Qwen2.5-1.5B-Instruct",
-            "device": resolved_device,
+            "device": secondary_device,
+            "quantization_mode": "4bit" if resolved_device == "cuda" else "none",
         })
     else:
         agent_configs["__slot_0__"]["model_type"] = "structured"
@@ -100,6 +118,7 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
         "strict_agent_execution": strict_agent_execution,
         "agent_configs": agent_configs,
         "device": resolved_device,
+        "cuda_device_count": cuda_device_count,
         "mode_label": "dummy_structured" if args.use_dummy or not use_model_reextract else "transformer_reextract",
     }
 

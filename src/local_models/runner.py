@@ -2,12 +2,27 @@
 Local model runner for CPU-only environments.
 Supports loading quantized or smaller models for multi-agent evaluation.
 """
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import time
 from abc import ABC, abstractmethod
 import os
 
 _PIPELINE_CACHE: Dict[tuple, Any] = {}
+
+
+def _resolve_pipeline_device(device: str) -> Tuple[int, bool]:
+    """Map a device string into a transformers pipeline device index."""
+    normalized = (device or "cpu").strip().lower()
+    if normalized == "cpu":
+        return -1, False
+    if normalized == "cuda":
+        return 0, True
+    if normalized.startswith("cuda:"):
+        try:
+            return int(normalized.split(":", 1)[1]), True
+        except ValueError:
+            return 0, True
+    return 0, True
 
 
 class LocalAgent(ABC):
@@ -99,32 +114,69 @@ class DummyLocalAgent(LocalAgent):
 
 class TransformerAgent(LocalAgent):
     """Agent that uses a local transformer model for generation and extraction."""
-    def __init__(self, agent_id: str, model_name: str, device: str = "cpu"):
+    def __init__(
+        self,
+        agent_id: str,
+        model_name: str,
+        device: str = "cpu",
+        quantization_mode: Optional[str] = None,
+    ):
         super().__init__(agent_id, model_name)
         self.device = device
+        self.quantization_mode = quantization_mode or ("4bit" if str(device).startswith("cuda") else "none")
         self.generator = None
         self._load_model()
 
     def _load_model(self):
         """Load the model into memory."""
         try:
-            from transformers import pipeline
-            cache_key = (self.model_name, self.device)
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
+            cache_key = (self.model_name, self.device, self.quantization_mode)
             if cache_key in _PIPELINE_CACHE:
                 self.generator = _PIPELINE_CACHE[cache_key]
                 print(f"Reusing cached model {self.model_name} on {self.device}.")
                 return
 
+            pipeline_device, use_cuda = _resolve_pipeline_device(self.device)
             print(f"Loading model {self.model_name} on {self.device}...")
-            model_kwargs = {
-                "model": self.model_name,
-                "device": -1 if self.device == "cpu" else 0,
-                "trust_remote_code": True,
-            }
-            self.generator = pipeline(
-                "text-generation",
-                **model_kwargs
-            )
+            if use_cuda:
+                model_kwargs: Dict[str, Any] = {
+                    "trust_remote_code": True,
+                    "device_map": {"": pipeline_device},
+                    "torch_dtype": torch.float16,
+                    "low_cpu_mem_usage": True,
+                }
+                if self.quantization_mode == "4bit":
+                    model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                        load_in_4bit=True,
+                        bnb_4bit_compute_dtype=torch.float16,
+                        bnb_4bit_quant_type="nf4",
+                        bnb_4bit_use_double_quant=True,
+                    )
+                elif self.quantization_mode == "8bit":
+                    model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+
+                model = AutoModelForCausalLM.from_pretrained(self.model_name, **model_kwargs)
+                tokenizer = AutoTokenizer.from_pretrained(self.model_name, trust_remote_code=True)
+                if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+                    tokenizer.pad_token_id = tokenizer.eos_token_id
+                self.generator = pipeline(
+                    "text-generation",
+                    model=model,
+                    tokenizer=tokenizer,
+                    trust_remote_code=True,
+                )
+            else:
+                model_kwargs = {
+                    "model": self.model_name,
+                    "device": pipeline_device,
+                    "trust_remote_code": True,
+                }
+                self.generator = pipeline(
+                    "text-generation",
+                    **model_kwargs
+                )
             _PIPELINE_CACHE[cache_key] = self.generator
             print(f"Model loaded successfully.")
         except Exception as e:
@@ -203,7 +255,8 @@ def create_agent(agent_id: str, model_type: str = "dummy", reliability: float = 
     elif model_type == "transformer":
         model_name = kwargs.get("model_name", "Qwen/Qwen2.5-1.5B-Instruct")
         device = kwargs.get("device", "cpu")
-        return TransformerAgent(agent_id, model_name=model_name, device=device)
+        quantization_mode = kwargs.get("quantization_mode")
+        return TransformerAgent(agent_id, model_name=model_name, device=device, quantization_mode=quantization_mode)
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 

@@ -18,6 +18,11 @@ except ImportError:
     HAVE_TQDM = False
 
 
+def _use_tqdm() -> bool:
+    disable_flag = os.environ.get("PROJECTMEM_DISABLE_TQDM", "").strip().lower()
+    return HAVE_TQDM and disable_flag not in {"1", "true", "yes", "on"}
+
+
 def load_custom_benchmark(path: str) -> List[Dict[str, Any]]:
     """Load custom JSONL benchmark."""
     rows = []
@@ -65,7 +70,11 @@ def run_evaluation_with_scenarios(
             strict_agent_execution=execution_config.get("strict_agent_execution", False),
         )
         mode_results = []
-        scenario_iter = tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios)) if HAVE_TQDM else scenarios
+        scenario_iter = (
+            tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios), ascii=True, dynamic_ncols=False)
+            if _use_tqdm()
+            else scenarios
+        )
         for scenario in scenario_iter:
             # Convert Scenario object to dict if needed
             scenario_dict = scenario.to_dict() if hasattr(scenario, 'to_dict') else scenario
@@ -168,7 +177,11 @@ def run_evaluation(
             strict_agent_execution=execution_config.get("strict_agent_execution", False),
         )
         mode_results = []
-        scenario_iter = tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios)) if HAVE_TQDM else scenarios
+        scenario_iter = (
+            tqdm(scenarios, desc=f"{mode} progress", total=len(scenarios), ascii=True, dynamic_ncols=False)
+            if _use_tqdm()
+            else scenarios
+        )
         for scenario in scenario_iter:
             # Convert Scenario object to dict if needed
             scenario_dict = scenario.to_dict() if hasattr(scenario, 'to_dict') else scenario
