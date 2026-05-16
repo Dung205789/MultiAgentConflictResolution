@@ -1,0 +1,15 @@
+{
+  "id": "dzungngo179/projectmem-main-full-qwen2p5-1p5b",
+  "title": "ProjectMem Main Full Qwen2p5 1p5b",
+  "code_file": "kaggle_runner_main_full.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "true",
+  "dataset_sources": [],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": []
+}
