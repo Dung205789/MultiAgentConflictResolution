@@ -1,6 +1,6 @@
 {
   "id": "dzungngo179/projectmem-main-full-qwen2p5-1p5b",
-  "title": "ProjectMem Main Full Qwen2p5 1p5b",
+  "title": "ProjectMem Main Full Qwen7B Phi4mini T4",
   "code_file": "kaggle_runner_main_full.ipynb",
   "language": "python",
   "kernel_type": "notebook",

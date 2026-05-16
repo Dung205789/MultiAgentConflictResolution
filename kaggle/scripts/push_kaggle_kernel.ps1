@@ -54,6 +54,12 @@ Write-Host "Notebook synced to $destNotebook"
 Write-Host "Using KAGGLE_CONFIG_DIR=$env:KAGGLE_CONFIG_DIR"
 Write-Host "Using KernelRef=$KernelRef"
 
+$currentStatus = kaggle kernels status $KernelRef 2>&1
+$currentStatusText = ($currentStatus | Out-String).Trim()
+if ($currentStatusText -match "RUNNING") {
+    Write-Host "Kernel is currently RUNNING. Pushing a new version will replace the active notebook revision."
+}
+
 kaggle kernels push -p $kernelPath
 
 for ($i = 0; $i -lt $MaxPolls; $i++) {
