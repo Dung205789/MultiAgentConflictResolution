@@ -6,6 +6,8 @@ from typing import Dict, Any, List, Optional, Tuple
 import time
 from abc import ABC, abstractmethod
 import os
+import json
+import re
 
 _PIPELINE_CACHE: Dict[tuple, Any] = {}
 
@@ -127,6 +129,7 @@ class TransformerAgent(LocalAgent):
         self.quantization_mode = quantization_mode or ("4bit" if str(device).startswith("cuda") else "none")
         self.strict_loading = strict_loading
         self.generator = None
+        self.last_extraction_response: str = ""
         self._load_model()
 
     def _load_model(self):
@@ -212,43 +215,104 @@ class TransformerAgent(LocalAgent):
             return []
 
         prompt = (
-            "Extract structured facts from the input text. "
-            "Return ONLY a JSON array. Each item must contain keys: "
-            "subject, predicate, object_val, confidence, provenance, rationale, support_spans, extractor_id. "
-            "Preserve subject and predicate exactly from the input when explicit. "
+            "Extract structured facts from the input text.\n"
+            "Return ONLY JSON, preferably a JSON array. A single JSON object is also acceptable.\n"
+            "Each item must contain keys: subject, predicate, object_val, confidence, provenance, rationale, support_spans, extractor_id.\n"
+            "Preserve explicit entities and relation names from the input when possible.\n"
             "Use provenance='llm_inferred'. Confidence must be between 0.5 and 0.95.\n"
+            "Example Input: Thomas Kyd was born in the city of London\n"
+            "Example Output: [{\"subject\":\"Thomas Kyd\",\"predicate\":\"birth_place\",\"object_val\":\"London\",\"confidence\":0.9,\"provenance\":\"llm_inferred\",\"rationale\":\"direct stated fact\",\"support_spans\":[{\"span_text\":\"Thomas Kyd was born in the city of London\",\"span_index\":0}],\"extractor_id\":\"extractor\"}]\n"
             f"Input: {text}\n"
             "Output JSON:"
         )
 
         try:
             response = self.generate_response(prompt, max_new_tokens=96)
-            # Parse JSON from response
-            import json
-            response = response.replace("```json", "").replace("```", "").strip()
-            # Find first [ and last ]
-            start = response.find("[")
-            end = response.rfind("]")
-            if start != -1 and end != -1:
-                json_str = response[start:end+1]
-                memories = json.loads(json_str)
-                # Validate and normalize
-                valid_memories = []
-                for m in memories:
-                    if isinstance(m, dict) and m.get("predicate") and m.get("object_val"):
-                        m.setdefault("subject", "unknown")
-                        m.setdefault("confidence", 0.7)
-                        m.setdefault("provenance", "llm_inferred")
-                        m.setdefault("rationale", "local_transformer_extraction")
-                        m.setdefault("support_spans", [{"span_text": text[:200], "span_index": 0}])
-                        m.setdefault("extractor_id", self.model_name)
-                        m.setdefault("challenger_metadata", None)
-                        valid_memories.append(m)
-                return valid_memories
+            self.last_extraction_response = response or ""
+            return self._parse_extraction_response(response, text)
         except Exception:
             pass
 
         return []
+
+    def _parse_extraction_response(self, response: str, source_text: str) -> List[Dict[str, Any]]:
+        cleaned = (response or "").replace("```json", "").replace("```", "").strip()
+        payload_candidates: List[Any] = []
+
+        array_match = re.search(r"\[[\s\S]*\]", cleaned)
+        if array_match:
+            try:
+                payload_candidates.append(json.loads(array_match.group(0)))
+            except Exception:
+                pass
+
+        object_match = re.search(r"\{[\s\S]*\}", cleaned)
+        if object_match:
+            try:
+                payload_candidates.append(json.loads(object_match.group(0)))
+            except Exception:
+                pass
+
+        line_fields = self._parse_line_fields(cleaned)
+        if line_fields:
+            payload_candidates.append(line_fields)
+
+        valid_memories: List[Dict[str, Any]] = []
+        for payload in payload_candidates:
+            items = payload if isinstance(payload, list) else [payload]
+            for item in items:
+                normalized = self._normalize_extracted_item(item, source_text)
+                if normalized:
+                    valid_memories.append(normalized)
+
+        deduped: List[Dict[str, Any]] = []
+        seen = set()
+        for item in valid_memories:
+            key = (item["subject"], item["predicate"], item["object_val"])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped
+
+    def _parse_line_fields(self, text: str) -> Optional[Dict[str, Any]]:
+        patterns = {
+            "subject": r"subject\s*[:=]\s*(.+)",
+            "predicate": r"predicate\s*[:=]\s*(.+)",
+            "object_val": r"(?:object_val|object)\s*[:=]\s*(.+)",
+        }
+        out: Dict[str, Any] = {}
+        for key, pattern in patterns.items():
+            match = re.search(pattern, text, flags=re.IGNORECASE)
+            if match:
+                out[key] = match.group(1).strip().strip('",')
+        return out or None
+
+    def _normalize_extracted_item(self, item: Any, source_text: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        subject = str(item.get("subject", "unknown")).strip()
+        predicate = str(item.get("predicate", "")).strip()
+        object_val = str(item.get("object_val", item.get("object", ""))).strip()
+        if not predicate or not object_val:
+            return None
+        try:
+            confidence = float(item.get("confidence", 0.7))
+        except Exception:
+            confidence = 0.7
+        confidence = max(0.5, min(confidence, 0.95))
+        normalized = {
+            "subject": subject or "unknown",
+            "predicate": predicate,
+            "object_val": object_val,
+            "confidence": confidence,
+            "provenance": item.get("provenance", "llm_inferred"),
+            "rationale": item.get("rationale", "local_transformer_extraction"),
+            "support_spans": item.get("support_spans", [{"span_text": source_text[:200], "span_index": 0}]),
+            "extractor_id": item.get("extractor_id", self.model_name),
+            "challenger_metadata": item.get("challenger_metadata", None),
+        }
+        return normalized
 
 
 def create_agent(agent_id: str, model_type: str = "dummy", reliability: float = None, **kwargs) -> LocalAgent:

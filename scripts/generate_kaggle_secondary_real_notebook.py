@@ -1,3 +1,4 @@
+import argparse
 import json
 from pathlib import Path
 
@@ -6,7 +7,7 @@ def _lines(text: str):
     return [line + "\n" for line in text.strip("\n").splitlines()]
 
 
-def build_notebook():
+def build_notebook(*, scenario_index: int, output_root: str):
     cells = [
         {
             "cell_type": "markdown",
@@ -18,13 +19,13 @@ def build_notebook():
 Notebook nay clone repo tu GitHub va chay secondary track `end_to_end_extract` voi model that.
 
 - benchmark: `MemoryAgentBench / Conflict_Resolution`
-- slice: scenario `1` trong 2 scenario dau tien
+- slice: scenario `__SCENARIO_INDEX__` trong 2 scenario dau tien
 - mode: `conflict_aware`
 - models: `Qwen/Qwen2.5-3B-Instruct` cho ca hai agent
 - khong `--use-dummy`
 - khong `--allow-structured-fallback-in-end-to-end`
 - GPU chap nhan: `T4` uu tien, neu Kaggle cap `P100` thi notebook se cai lai PyTorch CUDA 12.6 tuong thich truoc khi chay
-                """
+                """.replace("__SCENARIO_INDEX__", str(scenario_index))
             ),
         },
         {
@@ -44,7 +45,7 @@ from pathlib import Path
 REPO_URL = "https://github.com/Dung205789/MultiAgentConflictResolution.git"
 BRANCH = "main"
 WORKDIR = "/kaggle/working/ProjectMem"
-OUTPUT_ROOT = "/kaggle/working/projectmem_secondary_real_qwen3b"
+OUTPUT_ROOT = "__OUTPUT_ROOT__"
 BOOTSTRAP_PATH = f"{OUTPUT_ROOT}/bootstrap_status.json"
 
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
@@ -71,7 +72,7 @@ git_sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"]).decod
 print("WORKDIR", os.getcwd())
 print("GIT_SHA", git_sha)
 write_bootstrap("repo_synced", {"git_sha": git_sha})
-                """
+                """.replace("__OUTPUT_ROOT__", output_root)
             ),
         },
         {
@@ -167,17 +168,29 @@ import json
 import subprocess
 from pathlib import Path
 
-OUTPUT_DIR = "/kaggle/working/projectmem_secondary_real_qwen3b"
+OUTPUT_DIR = "__OUTPUT_ROOT__"
+RUN_LOG = Path(OUTPUT_DIR) / "secondary_run.log"
 cmd = [
-    "python", "scripts/run_secondary_track_real_model.py",
+    "python", "-u", "scripts/run_secondary_track_real_model.py",
     "--output-dir", OUTPUT_DIR,
-    "--scenario-index", "1",
+    "--scenario-index", "__SCENARIO_INDEX__",
     "--agent1-model", "Qwen/Qwen2.5-3B-Instruct",
     "--agent2-model", "Qwen/Qwen2.5-3B-Instruct",
     "--device", "auto",
 ]
 print("RUN:", " ".join(cmd))
-subprocess.run(cmd, check=True)
+with RUN_LOG.open("w", encoding="utf-8") as log_fp:
+    completed = subprocess.run(cmd, stdout=log_fp, stderr=subprocess.STDOUT, text=True, check=False)
+
+print("RUN_EXIT_CODE", completed.returncode)
+if RUN_LOG.exists():
+    print("RUN_LOG_PATH", str(RUN_LOG))
+    tail = RUN_LOG.read_text(encoding="utf-8", errors="replace")[-4000:]
+    print("RUN_LOG_TAIL_START")
+    print(tail)
+    print("RUN_LOG_TAIL_END")
+if completed.returncode != 0:
+    raise subprocess.CalledProcessError(completed.returncode, cmd)
 
 report_path = Path(OUTPUT_DIR) / "custom_report.json"
 if report_path.exists():
@@ -189,7 +202,7 @@ if report_path.exists():
     }, ensure_ascii=False, indent=2))
 else:
     print("Report not found yet:", report_path)
-                """
+                """.replace("__OUTPUT_ROOT__", output_root).replace("__SCENARIO_INDEX__", str(scenario_index))
             ),
         },
         {
@@ -204,14 +217,14 @@ else:
 import shutil
 from pathlib import Path
 
-output_root = Path("/kaggle/working/projectmem_secondary_real_qwen3b")
-zip_base = Path("/kaggle/working/projectmem_secondary_real_qwen3b_artifacts")
+output_root = Path("__OUTPUT_ROOT__")
+zip_base = Path("__OUTPUT_ROOT___artifacts")
 if output_root.exists():
     archive = shutil.make_archive(str(zip_base), "zip", root_dir=str(output_root))
     print("ARCHIVE", archive)
 else:
     print("Output root missing:", output_root)
-                """
+                """.replace("__OUTPUT_ROOT__", output_root)
             ),
         },
     ]
@@ -226,13 +239,24 @@ else:
     }
 
 
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Generate Kaggle notebook/kernel for secondary real-model runs.")
+    parser.add_argument("--scenario-index", type=int, default=1)
+    parser.add_argument("--output-root", default="/kaggle/working/projectmem_secondary_real_qwen3b")
+    parser.add_argument("--notebook-path", default="kaggle/kaggle_runner_secondary_real_qwen3b.ipynb")
+    parser.add_argument("--kernel-dir", default="kaggle/kernels/projectmem_secondary_real_qwen3b")
+    return parser
+
+
 def main():
-    notebook = build_notebook()
-    out_path = Path("kaggle/kaggle_runner_secondary_real_qwen3b.ipynb")
+    args = build_parser().parse_args()
+    notebook = build_notebook(scenario_index=args.scenario_index, output_root=args.output_root)
+    out_path = Path(args.notebook_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(notebook, ensure_ascii=False, indent=2), encoding="utf-8")
-    kernel_dir = Path("kaggle/kernels/projectmem_secondary_real_qwen3b")
+    kernel_dir = Path(args.kernel_dir)
     kernel_dir.mkdir(parents=True, exist_ok=True)
-    (kernel_dir / "kaggle_runner_secondary_real_qwen3b.ipynb").write_text(
+    (kernel_dir / out_path.name).write_text(
         json.dumps(notebook, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
