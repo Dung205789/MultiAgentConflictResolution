@@ -25,17 +25,7 @@ class LastWriteWinsWriter(BaseWriter):
         predicate = proposal["predicate"]
         object_val = proposal["object_val"]
 
-        entry = MemoryEntry(
-            subject=subject,
-            predicate=predicate,
-            object_val=object_val,
-            agent_id=agent_id,
-            confidence=float(proposal.get("confidence", 1.0)),
-            provenance=proposal.get("provenance", "inferred"),
-            raw_text=proposal.get("raw_text", ""),
-            canonical_claim=proposal.get("canonical_claim"),
-            memory_type=proposal.get("memory_type", "fact"),
-        )
+        entry = MemoryEntry.from_proposal(proposal, agent_id=agent_id)
 
         # Find active visible entries with same entity key and supersede them
         same_entity = [
@@ -46,7 +36,7 @@ class LastWriteWinsWriter(BaseWriter):
         entry.parent_version_id = parent_id
         entry.version_id = (same_entity[-1].version_id + 1) if same_entity else 1
 
-        self.store.propose_write(entry)
+        self.store.propose(entry)
         self.store.commit(
             entry.memory_id,
             resolution_action="overwrite",
@@ -57,7 +47,7 @@ class LastWriteWinsWriter(BaseWriter):
 
         # Supersede previous active after commit
         for r in same_entity:
-            r.status = "superseded"
+            self.store.supersede(r.memory_id, superseded_by=entry.memory_id)
 
         return {
             "memory_id": entry.memory_id,
@@ -81,19 +71,9 @@ class NaiveAppendWriter(BaseWriter):
             if r.subject == proposal["subject"] and r.predicate == proposal["predicate"] and r.status == "active"
         ]
 
-        entry = MemoryEntry(
-            subject=proposal["subject"],
-            predicate=proposal["predicate"],
-            object_val=proposal["object_val"],
-            agent_id=agent_id,
-            confidence=float(proposal.get("confidence", 1.0)),
-            provenance=proposal.get("provenance", "inferred"),
-            raw_text=proposal.get("raw_text", ""),
-            canonical_claim=proposal.get("canonical_claim"),
-            memory_type=proposal.get("memory_type", "fact"),
-        )
+        entry = MemoryEntry.from_proposal(proposal, agent_id=agent_id)
 
-        self.store.propose_write(entry)
+        self.store.propose(entry)
         self.store.commit(
             entry.memory_id,
             resolution_action="append",

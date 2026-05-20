@@ -1,24 +1,13 @@
 """
 Internal Standard Format (ISF) for Multi-Agent Conflict Resolution Scenarios.
 
-This module defines the canonical format used throughout the project.
-All benchmark adapters should convert their data to this format.
+Scenario/event/query wiring lives here. Canonical memory records now live in
+`src.memory.schema` and are shared by both benchmark gold state and runtime
+memory operations.
 """
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Any, Optional
-
-
-@dataclass
-class MemoryEntry:
-    """A single memory fact/triple."""
-    subject: str
-    predicate: str
-    object_val: Any
-    status: str = "active"  # "active", "deprecated", "merged"
-    confidence: Optional[float] = None
-    provenance: Optional[str] = None
-    timestamp: Optional[float] = None
-    agent_id: Optional[str] = None
+from src.memory.schema import MemoryEntry
 
 
 @dataclass

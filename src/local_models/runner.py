@@ -120,10 +120,12 @@ class TransformerAgent(LocalAgent):
         model_name: str,
         device: str = "cpu",
         quantization_mode: Optional[str] = None,
+        strict_loading: bool = False,
     ):
         super().__init__(agent_id, model_name)
         self.device = device
         self.quantization_mode = quantization_mode or ("4bit" if str(device).startswith("cuda") else "none")
+        self.strict_loading = strict_loading
         self.generator = None
         self._load_model()
 
@@ -180,6 +182,8 @@ class TransformerAgent(LocalAgent):
             _PIPELINE_CACHE[cache_key] = self.generator
             print(f"Model loaded successfully.")
         except Exception as e:
+            if self.strict_loading:
+                raise RuntimeError(f"Could not load model {self.model_name} on {self.device}: {e}") from e
             print(f"Warning: Could not load model {self.model_name}: {e}")
             print("Falling back to dummy agent behavior.")
             self.generator = None
@@ -210,7 +214,7 @@ class TransformerAgent(LocalAgent):
         prompt = (
             "Extract structured facts from the input text. "
             "Return ONLY a JSON array. Each item must contain keys: "
-            "subject, predicate, object_val, confidence, provenance. "
+            "subject, predicate, object_val, confidence, provenance, rationale, support_spans, extractor_id. "
             "Preserve subject and predicate exactly from the input when explicit. "
             "Use provenance='llm_inferred'. Confidence must be between 0.5 and 0.95.\n"
             f"Input: {text}\n"
@@ -235,6 +239,10 @@ class TransformerAgent(LocalAgent):
                         m.setdefault("subject", "unknown")
                         m.setdefault("confidence", 0.7)
                         m.setdefault("provenance", "llm_inferred")
+                        m.setdefault("rationale", "local_transformer_extraction")
+                        m.setdefault("support_spans", [{"span_text": text[:200], "span_index": 0}])
+                        m.setdefault("extractor_id", self.model_name)
+                        m.setdefault("challenger_metadata", None)
                         valid_memories.append(m)
                 return valid_memories
         except Exception:
@@ -264,7 +272,14 @@ def create_agent(agent_id: str, model_type: str = "dummy", reliability: float = 
         model_name = kwargs.get("model_name", "Qwen/Qwen2.5-1.5B-Instruct")
         device = kwargs.get("device", "cpu")
         quantization_mode = kwargs.get("quantization_mode")
-        return TransformerAgent(agent_id, model_name=model_name, device=device, quantization_mode=quantization_mode)
+        strict_loading = kwargs.get("strict_loading", False)
+        return TransformerAgent(
+            agent_id,
+            model_name=model_name,
+            device=device,
+            quantization_mode=quantization_mode,
+            strict_loading=strict_loading,
+        )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")
 

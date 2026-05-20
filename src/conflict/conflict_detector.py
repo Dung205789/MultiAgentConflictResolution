@@ -28,8 +28,8 @@ def _get_overlap_score():
 
 # Thresholds
 DUPLICATE_THRESHOLD = 0.95
-SEMANTIC_OVERLAP_THRESHOLD = 0.5  # lowered from 0.7 for better semantic_overlap detection
-COMPATIBLE_THRESHOLD = 0.5
+SEMANTIC_OVERLAP_THRESHOLD = 0.7
+COMPATIBLE_THRESHOLD = 0.45
 CONTRADICTION_THRESHOLD = 0.3
 
 # Embedding model (lazy loaded)
@@ -86,6 +86,7 @@ MUTUALLY_EXCLUSIVE_PREDICATES = {
     "city", "study_time", "location", "current_location", "current_task",
     "current_focus", "current_activity", "current_mood", "current_status",
     "born_in", "death_place", "place_of_birth", "place_of_death",
+    "capital",
     # Identity (single-valued)
     "ssn", "email", "phone", "passport_number", "id_number", "birth_date", "death_date",
     # Position/title (typically singular)
@@ -103,6 +104,9 @@ MUTUALLY_EXCLUSIVE_PREDICATES = {
     "ceo", "position", "sport", "religion", "educated_at",
     "headquarters_city", "employer", "origin_country", "origin_city",
     "producer_company", "original_broadcaster", "music_type", "child",
+    "citizenship", "spouse", "work_location", "language", "head_coach",
+    "governor", "mayor", "attorney_general", "head_of_commonwealth",
+    "minister_of_external_affairs", "pope_holder", "tanaiste",
 }
 
 ADDITIVE_PREDICATES = {
@@ -113,6 +117,12 @@ ADDITIVE_PREDICATES = {
     "role", "roles",  # can have multiple roles
     "technology", "technologies",  # overlapping tech stacks
     "product", "products",  # companies can have multiple products
+}
+
+OPEN_TEXT_PREDICATES = {
+    "bio", "biography", "description", "summary", "overview", "profile",
+    "background", "experience", "note", "notes", "comment", "comments",
+    "trait", "traits", "strength", "strengths", "weakness", "weaknesses",
 }
 
 # Copular verbs that need object-level analysis
@@ -146,6 +156,16 @@ def _tokenize(text: str) -> List[str]:
     return [tok for tok in re.split(r"[^a-z0-9]+", (text or "").lower()) if tok]
 
 
+def _looks_like_open_text_value(text: str) -> bool:
+    """Heuristic for descriptive free-form values rather than entity slots."""
+    tokens = _tokenize(text)
+    if len(tokens) >= 5:
+        return True
+    separators = [",", ";", " and ", " with ", " who ", " that "]
+    lowered = (text or "").lower()
+    return any(sep in lowered for sep in separators)
+
+
 def _looks_like_single_valued_claim(old_obj: str, new_obj: str) -> bool:
     """
     Heuristic for detecting single-valued claims.
@@ -165,11 +185,12 @@ def _looks_like_single_valued_claim(old_obj: str, new_obj: str) -> bool:
     new_tokens = _tokenize(new_norm)
     if len(old_tokens) >= 3 and len(new_tokens) >= 3:
         overlap = len(set(old_tokens) & set(new_tokens)) / max(len(old_tokens), len(new_tokens))
-        if overlap >= 0.6 and abs(len(old_tokens) - len(new_tokens)) <= 3:
+        if overlap >= 0.8 and abs(len(old_tokens) - len(new_tokens)) <= 2:
             return True
 
-    # Conservative: default to True for conflicting atomic claims
-    return True
+    # Without explicit cues or strong template overlap, do not assume
+    # descriptive free-form values are single-valued.
+    return False
 
 
 def _is_concurrent_update(proposal: Dict[str, Any], candidates: List[Dict[str, Any]]) -> bool:
@@ -252,8 +273,21 @@ def is_likely_mutually_exclusive(predicate: str, old_obj: str, new_obj: str) -> 
     if is_additive_predicate(pred):
         return False
 
-    # For unknown predicates, use heuristic
-    return _looks_like_single_valued_claim(old_obj, new_obj)
+    # Open descriptive predicates should stay extensible unless they hit
+    # an explicit single-value cue.
+    if pred in OPEN_TEXT_PREDICATES:
+        return _looks_like_single_valued_claim(old_obj, new_obj)
+
+    # Unknown predicates in this benchmark are usually short entity slots.
+    # Keep overwrite semantics for terse values, but avoid forcing
+    # descriptive text into mutually-exclusive conflicts.
+    if _looks_like_open_text_value(old_obj) or _looks_like_open_text_value(new_obj):
+        return _looks_like_single_valued_claim(old_obj, new_obj)
+
+    if old_obj and new_obj:
+        return True
+
+    return False
 
 
 def _is_mab_single_value_language_conflict(

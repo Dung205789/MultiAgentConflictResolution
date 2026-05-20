@@ -3,16 +3,21 @@
 
 arbitration:
   weights:
-    confidence: 0.5
-    provenance: 0.25
-    recency: 0.2
-    authority: 0.05
+    confidence: 0.24
+    provenance: 0.16
+    recency: 0.12
+    authority: 0.08
+    answer_criticality: 0.24
+    graph_support: 0.10
+    query_coverage: 0.06
   recency_half_life: 3600.0  # seconds
 
 thresholds:
   overwrite_margin: 0.05             # Minimum score difference to prefer overwrite (aggressive)
   keep_multiple_versions_margin: 0.02 # Score margin too close -> keep both (very aggressive)
   defer_below_score: 0.30            # New entry score below this -> defer (lowered)
+  answer_critical_margin: 0.15       # Query-aware overwrite/reject trigger
+  answer_critical_keep_threshold: 0.55
   semantic_duplicate: 0.95           # Cosine similarity threshold for exact duplicate
   semantic_overlap: 0.70             # Threshold for significant overlap
   contradiction_low_similarity: 0.30 # Below this similarity, consider contradiction
@@ -38,27 +43,42 @@ default_authority: 1.0             # Default authority score when not available
 # Scenarios can dynamically adjust arbitration weights
 context_weights:
   factual_dispute:
-    confidence: 0.5
-    provenance: 0.25
-    recency: 0.15
-    authority: 0.1
+    confidence: 0.22
+    provenance: 0.16
+    recency: 0.10
+    authority: 0.08
+    answer_criticality: 0.28
+    graph_support: 0.10
+    query_coverage: 0.06
   temporal_update:
     confidence: 0.3
     provenance: 0.2
     recency: 0.4
     authority: 0.1
+    answer_criticality: 0.0
+    graph_support: 0.0
+    query_coverage: 0.0
   cross_agent_merge:
-    confidence: 0.35
-    provenance: 0.35
-    recency: 0.2
-    authority: 0.1
+    confidence: 0.18
+    provenance: 0.22
+    recency: 0.10
+    authority: 0.08
+    answer_criticality: 0.26
+    graph_support: 0.10
+    query_coverage: 0.06
   low_uncertainty:
     confidence: 0.5
     provenance: 0.3
     recency: 0.1
     authority: 0.1
+    answer_criticality: 0.0
+    graph_support: 0.0
+    query_coverage: 0.0
   high_uncertainty:
     confidence: 0.3
     provenance: 0.25
     recency: 0.25
     authority: 0.2
+    answer_criticality: 0.0
+    graph_support: 0.0
+    query_coverage: 0.0

@@ -1,14 +1,20 @@
 import json
 import time
 from typing import Dict, Any, List, Optional
-from dataclasses import asdict
 
+from src.benchmarks.scenario_contract import scenario_to_dict
 from src.memory.shared_memory_store import SharedMemoryStore
 from src.agents.agent_runtime import AgentRuntime
 from src.conflict.staleness_detector import StalenessDetector
 from src.conflict.conflict_aware_writer import ConflictAwareWriter
 from src.conflict.baselines import LastWriteWinsWriter, NaiveAppendWriter
+from src.conflict.query_aware_context import (
+    annotate_proposal_with_query_context,
+    build_query_plan,
+    summarize_query_plan,
+)
 from src.evaluation.qa_reasoner import answer_question_from_memories, score_answers
+from src.memory.proposal_contract import normalize_proposal
 
 
 class MultiAgentPipeline:
@@ -25,9 +31,14 @@ class MultiAgentPipeline:
         agent_configs: Optional[Dict[str, Dict[str, Any]]] = None,
         proposal_source: str = "structured",
         strict_agent_execution: bool = False,
+        conflict_aware_variant: str = "full",
+        track_name: str = "oracle_structured",
+        allow_structured_fallback_in_end_to_end: bool = False,
     ):
         assert mode in {"conflict_aware", "lww", "naive"}
         assert proposal_source in {"structured", "agent_extract"}
+        assert conflict_aware_variant in {"full", "no_lineage_edges", "no_query_support"}
+        assert track_name in {"oracle_structured", "end_to_end_extract"}
         self.mode = mode
         self.store = SharedMemoryStore(
             persistence_path=persistence_path,
@@ -37,13 +48,20 @@ class MultiAgentPipeline:
         self.agent_configs = agent_configs or {}
         self.proposal_source = proposal_source
         self.strict_agent_execution = strict_agent_execution
+        self.conflict_aware_variant = conflict_aware_variant
+        self.track_name = track_name
+        self.allow_structured_fallback_in_end_to_end = allow_structured_fallback_in_end_to_end
         self.staleness_detector = StalenessDetector()
         self.conflict_writer = None
         self.lww_writer = None
         self.naive_writer = None
 
         if self.mode == "conflict_aware":
-            self.conflict_writer = ConflictAwareWriter(self.store, self.staleness_detector)
+            self.conflict_writer = ConflictAwareWriter(
+                self.store,
+                self.staleness_detector,
+                variant=self.conflict_aware_variant,
+            )
         elif self.mode == "lww":
             self.lww_writer = LastWriteWinsWriter(self.store)
         else:
@@ -70,6 +88,7 @@ class MultiAgentPipeline:
                     model_type="transformer",
                     model_name=cfg.get("model_name", "Qwen/Qwen2.5-1.5B-Instruct"),
                     device=cfg.get("device", "cpu"),
+                    strict_loading=self.strict_agent_execution,
                 )
             agents[aid] = {
                 "runtime": runtime,
@@ -88,7 +107,7 @@ class MultiAgentPipeline:
         prepared = dict(proposal or {})
         prepared.setdefault("agent_id", event_payload.get("agent_id"))
 
-        source_used = "structured"
+        source_used = "oracle_structured"
         if self.proposal_source == "agent_extract":
             seed_text = (
                 prepared.get("raw_text")
@@ -115,15 +134,12 @@ class MultiAgentPipeline:
                     if key in prepared and key not in merged:
                         merged[key] = prepared[key]
                 prepared = merged
-                source_used = "agent_extract"
+                source_used = "end_to_end_extract"
             elif self.strict_agent_execution:
-                # On accepted benchmarks we already have adapter-structured proposals.
-                # If model extraction returns nothing, keep the structured proposal so one
-                # bad generation does not abort the entire run.
-                if prepared.get("predicate") and prepared.get("object_val"):
+                if self.allow_structured_fallback_in_end_to_end and prepared.get("predicate") and prepared.get("object_val"):
                     prepared.setdefault("raw_text", seed_text)
                     prepared["_agent_extract_fallback"] = "structured_proposal"
-                    source_used = "structured_fallback"
+                    source_used = "end_to_end_extract__structured_fallback"
                 else:
                     raise RuntimeError(
                         f"Agent extraction failed for {event_payload.get('agent_id')} under strict agent execution mode."
@@ -133,7 +149,28 @@ class MultiAgentPipeline:
             prepared["agent_authority"] = float(reliability)
             prepared.setdefault("confidence", float(reliability))
 
+        if source_used == "oracle_structured":
+            prepared = normalize_proposal(
+                prepared,
+                source_label=source_used,
+                default_extractor_id="oracle_structured_adapter",
+                default_provenance=prepared.get("provenance", "benchmark_structured"),
+                default_confidence=float(prepared.get("confidence", reliability or 1.0)),
+                default_rationale="benchmark_adapter_structured_proposal",
+            )
+        else:
+            extractor = agent_info.get("extractor")
+            prepared = normalize_proposal(
+                prepared,
+                source_label=source_used,
+                default_extractor_id=getattr(extractor, "model_name", None) or event_payload.get("agent_id") or "end_to_end_extractor",
+                default_provenance=prepared.get("provenance", "llm_inferred"),
+                default_confidence=float(prepared.get("confidence", reliability or 0.7)),
+                default_rationale="extractor_generated_proposal",
+            )
+
         prepared["_proposal_source"] = source_used
+        prepared["_track_name"] = self.track_name
         return prepared
 
     def run_scenario(self, scenario: Dict[str, Any], enable_retrieval_eval: bool = False) -> Dict[str, Any]:
@@ -153,21 +190,12 @@ class MultiAgentPipeline:
             with open(self.store.persistence_path, "w", encoding="utf-8") as f:
                 f.write("")
 
-        # Handle both Scenario objects and dicts
-        if hasattr(scenario, 'agents'):
-            agents_list = scenario.agents
-            events_list = scenario.ordered_events
-            queries_list = scenario.queries
-            scenario_id = scenario.scenario_id
-            agent_profiles = scenario.agent_profiles or {}
-            gold_visible = scenario.gold_visible_shared_state_after_commit
-        else:
-            agents_list = scenario.get("agents", [])
-            events_list = scenario.get("ordered_events", [])
-            queries_list = scenario.get("queries", [])
-            scenario_id = scenario.get("scenario_id")
-            agent_profiles = scenario.get("agent_profiles", {})
-            gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
+        scenario_dict = scenario_to_dict(scenario)
+        agents_list = scenario_dict.get("agents", [])
+        events_list = scenario_dict.get("ordered_events", [])
+        queries_list = scenario_dict.get("queries", [])
+        scenario_id = scenario_dict.get("scenario_id")
+        agent_profiles = scenario_dict.get("agent_profiles", {})
 
         agents = self._build_agents(agents_list)
 
@@ -183,10 +211,15 @@ class MultiAgentPipeline:
             "retrieval_results": [] if enable_retrieval_eval else None,
             "qa_results": [] if enable_retrieval_eval else None,
             "execution": {
+                "track_name": self.track_name,
                 "proposal_source": self.proposal_source,
                 "strict_agent_execution": self.strict_agent_execution,
+                "conflict_aware_variant": self.conflict_aware_variant,
+                "allow_structured_fallback_in_end_to_end": self.allow_structured_fallback_in_end_to_end,
             },
         }
+        query_plan = build_query_plan(queries_list)
+        logs["execution"]["query_plan"] = summarize_query_plan(query_plan)
 
         # Process events
         for ev in events_list:
@@ -234,6 +267,11 @@ class MultiAgentPipeline:
                     "text": getattr(ev, "text", None) if hasattr(ev, "agent_id") else ev.get("text"),
                 }
                 proposal = self._prepare_proposal(agent_info, ev_proposal, event_payload, reliability)
+                proposal = annotate_proposal_with_query_context(
+                    proposal,
+                    query_plan,
+                    variant=self.conflict_aware_variant,
+                )
                 logs["write_proposals"].append({
                     "step": ev_step,
                     "agent_id": aid,
@@ -268,6 +306,13 @@ class MultiAgentPipeline:
                 logs["arbitration_decisions"].append({
                     "step": ev_step,
                     "agent_id": aid,
+                    "proposal": {
+                        "subject": proposal.get("subject"),
+                        "predicate": proposal.get("predicate"),
+                        "object_val": proposal.get("object_val"),
+                        "raw_text": proposal.get("raw_text"),
+                        "proposal_source": proposal.get("_proposal_source", "structured"),
+                    },
                     "resolution_action": result.get("resolution_action", result.get("action")),
                     "result": result,
                 })
@@ -309,7 +354,7 @@ class MultiAgentPipeline:
                     })
 
         # Compute final metrics
-        logs["metrics"] = self._compute_scenario_metrics(scenario, logs)
+        logs["metrics"] = self._compute_scenario_metrics(scenario_dict, logs)
 
         return logs
 
@@ -336,13 +381,9 @@ class MultiAgentPipeline:
             for mem in memories
         )
 
-    def _compute_scenario_metrics(self, scenario: Any, logs: Dict[str, Any]) -> Dict[str, Any]:
+    def _compute_scenario_metrics(self, scenario: Dict[str, Any], logs: Dict[str, Any]) -> Dict[str, Any]:
         """Compute metrics for this scenario."""
-        # Handle both Scenario objects and dicts
-        if hasattr(scenario, 'gold_visible_shared_state_after_commit'):
-            gold_visible = [asdict(m) for m in scenario.gold_visible_shared_state_after_commit]
-        else:
-            gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
+        gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
         final_visible = logs["final_visible_state"]
 
         # Normalize states for comparison
@@ -361,6 +402,7 @@ class MultiAgentPipeline:
             "state_match": state_match,
             "num_writes": len(logs["write_proposals"]),
             "num_conflicts": len(logs["detected_conflicts"]),
+            "scenario_contract_version": scenario.get("_scenario_contract_version"),
         }
 
         if logs["retrieval_results"]:

@@ -71,10 +71,14 @@ def _parse_facts_from_context(context: str) -> List[Dict[str, Any]]:
     lines = context.split('\n')
 
     for line in lines:
-        # Match pattern: "0. Thomas Kyd was born in London."
-        match = re.match(r'\s*\d+\.\s+(.+?)(?:\.|$)', line.strip())
+        # Keep the full numbered line instead of stopping at the first "."
+        # inside abbreviations such as "Apple Inc." or initials such as
+        # "Ursula K. Le Guin".
+        match = re.match(r'^\s*\d+\.\s+(.*)$', line.strip())
         if match:
             fact_text = match.group(1).strip()
+            if fact_text.endswith("."):
+                fact_text = fact_text[:-1].rstrip()
             facts.append({
                 'raw_text': fact_text,
                 'fact_id': len(facts)
@@ -97,8 +101,22 @@ def _extract_entity_and_predicate(fact_text: str) -> Tuple[str, str, str]:
         (r"^The author of (.+?) is (.+?)$", "author"),
         (r"^The chief executive officer of (.+?) is (.+?)$", "ceo"),
         (r"^The capital of (.+?) is (.+?)$", "capital"),
+        (r"^The original language of (.+?) is (.+?)$", "language"),
+        (r"^The original broadcaster of (.+?) is (.+?)$", "original_broadcaster"),
+        (r"^The origianl broadcaster of (.+?) is (.+?)$", "original_broadcaster"),
+        (r"^The head coach of (.+?) is (.+?)$", "head_coach"),
+        (r"^The President of (.+?) is (.+?)$", "head_of_state"),
+        (r"^The Governor of (.+?) is (.+?)$", "governor"),
+        (r"^The Mayor of (.+?) is (.+?)$", "mayor"),
+        (r"^The Illinois Attorney General is (.+?)$", "attorney_general"),
+        (r"^The Head of the Commonwealth is (.+?)$", "head_of_commonwealth"),
+        (r"^The Minister of External Affairs is (.+?)$", "minister_of_external_affairs"),
+        (r"^The pope is (.+?)$", "pope_holder"),
+        (r"^The Tánaiste is (.+?)$", "tanaiste"),
         (r"^The official language of (.+?) is (.+?)$", "official_language"),
         (r"^The name of the current head of state in (.+?) is (.+?)$", "head_of_state"),
+        (r"^The name of the current head of the (.+?) government is (.+?)$", "head_of_state"),
+        (r"^The current head of state in (.+?) is (.+?)$", "head_of_state"),
         (r"^The Prime Minister of (.+?) is (.+?)$", "prime_minister"),
         (r"^The headquarters of (.+?) is located in the city of (.+?)$", "headquarters_city"),
         (r"^The univeristy where (.+?) was educated is (.+?)$", "educated_at"),
@@ -109,6 +127,16 @@ def _extract_entity_and_predicate(fact_text: str) -> Tuple[str, str, str]:
     for pattern, predicate in direct_patterns:
         match = re.match(pattern, text, re.IGNORECASE)
         if match:
+            if match.lastindex == 1:
+                synthetic_subject = {
+                    "attorney_general": "Illinois",
+                    "head_of_commonwealth": "Commonwealth",
+                    "minister_of_external_affairs": "India",
+                    "pope_holder": "Papacy",
+                    "tanaiste": "Ireland",
+                }.get(predicate)
+                if synthetic_subject is not None:
+                    return synthetic_subject, predicate, match.group(1).strip()
             return match.group(1).strip(), predicate, match.group(2).strip()
 
     subject_patterns = [
@@ -124,6 +152,9 @@ def _extract_entity_and_predicate(fact_text: str) -> Tuple[str, str, str]:
         (r"^(.+?) was created in the country of (.+?)$", "origin_country"),
         (r"^(.+?) was performed by (.+?)$", "performer"),
         (r"^(.+?) was created by (.+?)$", "creator"),
+        (r"^(.+?) was developed by (.+?)$", "producer_company"),
+        (r"^(.+?) was written in the language of (.+?)$", "language"),
+        (r"^(.+?) was written by (.+?)$", "author"),
         (r"^(.+?) is famous for (.+?)$", "known_for"),
         (r"^(.+?) is located in the continent of (.+?)$", "location"),
         (r"^(.+?) speaks the language of (.+?)$", "language"),

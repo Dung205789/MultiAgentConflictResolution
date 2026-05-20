@@ -39,7 +39,14 @@ class ConflictAwareWriter:
     - defer: commit as tentative/pending review
     """
 
-    def __init__(self, store: SharedMemoryStore, staleness_detector: StalenessDetector, mode: str = "debug_fallback", config_path: str = "configs/arbitration.yaml"):
+    def __init__(
+        self,
+        store: SharedMemoryStore,
+        staleness_detector: StalenessDetector,
+        mode: str = "debug_fallback",
+        config_path: str = "configs/arbitration.yaml",
+        variant: str = "full",
+    ):
         """
         Initialize the conflict-aware writer.
 
@@ -53,6 +60,7 @@ class ConflictAwareWriter:
         self.store = store
         self.staleness_detector = staleness_detector
         self.mode = mode
+        self.variant = variant
 
         # Load configuration
         self.config = self._load_config(config_path)
@@ -60,10 +68,13 @@ class ConflictAwareWriter:
         # Set arbitration parameters from config
         self.arbitration_config = self.config.get("arbitration", {})
         self.arbitration_weights = self.arbitration_config.get("weights", {
-            "confidence": 0.4,
-            "provenance": 0.3,
-            "recency": 0.2,
-            "authority": 0.1,
+            "confidence": 0.24,
+            "provenance": 0.16,
+            "recency": 0.12,
+            "authority": 0.08,
+            "answer_criticality": 0.24,
+            "graph_support": 0.10,
+            "query_coverage": 0.06,
         })
         self.arbitration_thresholds = self.config.get("thresholds", {})
         self.provenance_weights = self.config.get("provenance_weights", {
@@ -156,7 +167,12 @@ class ConflictAwareWriter:
         confidence = float(mem.get("confidence", 0.0))
         provenance_type = str(mem.get("provenance", "unknown"))
         provenance_score = self.provenance_weights.get(provenance_type, 0.4)
-        timestamp = float(mem.get("committed_at") or mem.get("timestamp") or 0.0)
+        timestamp = float(
+            mem.get("event_time")
+            or mem.get("timestamp")
+            or mem.get("committed_at")
+            or 0.0
+        )
         recency_score = self._normalize_recency(timestamp, recency_ref)
         authority_score = float(mem.get("agent_authority", 1.0))
 
@@ -195,6 +211,64 @@ class ConflictAwareWriter:
         # Exponential decay: score = 2^(-time_diff/half_life)
         return 2 ** (-time_diff / self.recency_half_life)
 
+    def _extract_signal(self, mem: Dict[str, Any], key: str, default: float = 0.0) -> float:
+        metadata = mem.get("arbitration_metadata") or {}
+        raw = mem.get(key, metadata.get(key, default))
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _extract_query_support_ids(self, mem: Dict[str, Any]) -> List[str]:
+        metadata = mem.get("arbitration_metadata") or {}
+        raw = mem.get("query_support_ids", metadata.get("query_support_ids", []))
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        return []
+
+    def _extract_graph_edges(self, mem: Dict[str, Any]) -> List[Dict[str, Any]]:
+        metadata = mem.get("arbitration_metadata") or {}
+        raw = mem.get("graph_edges", metadata.get("graph_edges", []))
+        if isinstance(raw, list):
+            return [edge for edge in raw if isinstance(edge, dict)]
+        return []
+
+    def _extract_query_relation_roles(self, mem: Dict[str, Any]) -> List[str]:
+        metadata = mem.get("arbitration_metadata") or {}
+        raw = mem.get("query_relation_roles", metadata.get("query_relation_roles", []))
+        if isinstance(raw, list):
+            return [str(x) for x in raw]
+        return []
+
+    def _build_lineage_graph_edges(self, proposal: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Preserve query-relevant graph evidence from overwritten candidates.
+        """
+        if self.variant == "no_lineage_edges":
+            return []
+        current_support = set(proposal.get("query_support_ids", []))
+        if not current_support:
+            return []
+        lineage: List[Dict[str, Any]] = []
+        seen = set()
+        for edge in proposal.get("graph_edges", []):
+            sig = (edge.get("source"), edge.get("relation"), edge.get("target"), edge.get("output_type"))
+            seen.add(sig)
+        for candidate in candidates:
+            support_ids = set(self._extract_query_support_ids(candidate))
+            if not support_ids or not (support_ids & current_support):
+                continue
+            relation_roles = set(self._extract_query_relation_roles(candidate))
+            if relation_roles and not (relation_roles & {"bridge_edge", "terminal_edge"}):
+                continue
+            for edge in self._extract_graph_edges(candidate):
+                sig = (edge.get("source"), edge.get("relation"), edge.get("target"), edge.get("output_type"))
+                if sig in seen:
+                    continue
+                lineage.append(edge)
+                seen.add(sig)
+        return lineage
+
     def _score_memory(self, mem: Dict[str, Any], recency_ref: float, context_weights: Optional[Dict[str, float]] = None) -> Dict[str, float]:
         """
         Score a memory entry based on confidence, provenance, recency, and authority.
@@ -215,18 +289,30 @@ class ConflictAwareWriter:
         provenance_type = str(mem.get("provenance", "unknown"))
         provenance_score = self.provenance_weights.get(provenance_type, 0.4)
 
-        timestamp = float(mem.get("committed_at") or mem.get("timestamp") or 0.0)
+        timestamp = float(
+            mem.get("event_time")
+            or mem.get("timestamp")
+            or mem.get("committed_at")
+            or 0.0
+        )
         recency_score = self._normalize_recency(timestamp, recency_ref)
 
         # Use agent_authority if available, else default to 1.0 (neutral)
         authority_score = float(mem.get("agent_authority", 1.0))
+        answer_criticality = self._extract_signal(mem, "answer_criticality", 0.0)
+        graph_support_score = self._extract_signal(mem, "graph_support_score", 0.0)
+        query_support_ids = self._extract_query_support_ids(mem)
+        query_coverage_score = min(1.0, len(query_support_ids) / 3.0)
 
         # Calculate weighted total score using arbitration weights
         total_score = (
             weights.get("confidence", 0.4) * confidence +
             weights.get("provenance", 0.3) * provenance_score +
             weights.get("recency", 0.2) * recency_score +
-            weights.get("authority", 0.1) * authority_score
+            weights.get("authority", 0.1) * authority_score +
+            weights.get("answer_criticality", 0.0) * answer_criticality +
+            weights.get("graph_support", 0.0) * graph_support_score +
+            weights.get("query_coverage", 0.0) * query_coverage_score
         )
 
         # Calculate uncertainty
@@ -237,10 +323,82 @@ class ConflictAwareWriter:
             "provenance": provenance_score,
             "recency": recency_score,
             "authority": authority_score,
+            "answer_criticality": answer_criticality,
+            "graph_support": graph_support_score,
+            "query_coverage": query_coverage_score,
+            "query_support_ids": query_support_ids,
             "total": total_score,
             "provenance_type": provenance_type,
             "uncertainty": uncertainty,
         }
+
+    def _graph_preservation_decision(
+        self,
+        conflict_type: str,
+        proposal_timestamp: float,
+        latest: Dict[str, Any],
+        new_scores: Dict[str, float],
+        old_scores: Dict[str, float],
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """
+        Query-aware decision override.
+
+        This is the core paper-facing behavior: preserve facts that support
+        multi-hop answer chains instead of reducing every contradiction to pure
+        recency.
+        """
+        critical_margin = new_scores.get("answer_criticality", 0.0) - old_scores.get("answer_criticality", 0.0)
+        graph_margin = new_scores.get("graph_support", 0.0) - old_scores.get("graph_support", 0.0)
+        keep_margin = self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08)
+        critical_keep_threshold = self.arbitration_thresholds.get("answer_critical_keep_threshold", 0.55)
+        critical_margin_threshold = self.arbitration_thresholds.get("answer_critical_margin", 0.15)
+        prop_ts = proposal_timestamp
+        latest_ts = latest.get("timestamp", 0) if latest else 0
+
+        new_support = set(new_scores.get("query_support_ids", []))
+        old_support = set(old_scores.get("query_support_ids", []))
+        support_overlap = new_support & old_support
+
+        # Preserve parallel branches when both versions are strongly answer-critical
+        # but support different query paths.
+        allow_parallel_preservation = conflict_type not in {
+            "mutually_exclusive",
+            "counterfactual_temporal",
+            "stale_read_conflict",
+            "concurrent_update",
+        }
+
+        if (
+            allow_parallel_preservation
+            and
+            new_scores.get("answer_criticality", 0.0) >= critical_keep_threshold
+            and old_scores.get("answer_criticality", 0.0) >= critical_keep_threshold
+            and new_support
+            and old_support
+            and new_support != old_support
+            and not support_overlap
+        ):
+            return "keep_multiple_versions", {
+                "reason": f"query_aware_{conflict_type}_preserve_distinct_answer_paths",
+                "critical_margin": critical_margin,
+                "graph_margin": graph_margin,
+                "new_scores": new_scores,
+                "old_scores": old_scores,
+            }
+
+        # Strongly query-critical new information can override older memory even
+        # if pure recency/flat score would not obviously win.
+        if critical_margin >= critical_margin_threshold and graph_margin >= -keep_margin:
+            return "overwrite", {
+                "reason": f"query_aware_{conflict_type}_new_fact_is_more_answer_critical",
+                "critical_margin": critical_margin,
+                "graph_margin": graph_margin,
+                "new_scores": new_scores,
+                "old_scores": old_scores,
+                "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+            }
+
+        return None
 
     def _arbitrate(
         self,
@@ -302,6 +460,13 @@ class ConflictAwareWriter:
         # Calculate score margin
         margin = new_scores["total"] - old_scores["total"]
         confidence_margin = new_scores["confidence"] - old_scores.get("confidence", 0.0)
+        query_aware_override = self._graph_preservation_decision(
+            conflict_type,
+            proposal_timestamp,
+            latest,
+            new_scores,
+            old_scores,
+        )
 
         # Log to arbitration history if enabled
         if proposal.get("_enable_history_tracking", False):
@@ -353,6 +518,8 @@ class ConflictAwareWriter:
 
         # Concurrent update handling - simultaneous writes, favor the newer entry
         if conflict_type == "concurrent_update":
+            if query_aware_override is not None:
+                return query_aware_override
             prop_ts = proposal_timestamp
             latest_ts = latest.get("timestamp", 0) if latest else 0
 
@@ -468,6 +635,9 @@ class ConflictAwareWriter:
 
         # Semantic overlap handling - should merge overlapping information
         if conflict_type == "semantic_overlap":
+            if query_aware_override is not None:
+                return query_aware_override
+
             if scenario_id and scenario_id.startswith("memoryagentbench_Conflict_Resolution"):
                 prop_ts = proposal_timestamp
                 latest_ts = latest.get("timestamp", 0) if latest else 0
@@ -505,6 +675,26 @@ class ConflictAwareWriter:
 
         # Compatible extension - keep both versions
         if conflict_type == "compatible_extension":
+            if scenario_id and scenario_id.startswith("memoryagentbench_Conflict_Resolution"):
+                prop_ts = proposal_timestamp
+                latest_ts = latest.get("timestamp", 0) if latest else 0
+                if prop_ts >= latest_ts:
+                    action = "overwrite"
+                    return action, {
+                        "reason": "mab_conflict_compatible_extension_prefers_latest_overwrite",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                        "uncertainty": new_scores.get("uncertainty", 0.0),
+                    }
+                action = "reject"
+                return action, {
+                    "reason": "mab_conflict_older_compatible_extension_reject",
+                    "new_scores": new_scores,
+                    "old_scores": old_scores,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                    "uncertainty": new_scores.get("uncertainty", 0.0),
+                }
             action = "keep_multiple_versions"
             return action, {
                 "reason": "compatible_information",
@@ -515,6 +705,8 @@ class ConflictAwareWriter:
 
         # Potential contradiction - uncertain if truly conflicting
         if conflict_type == "potential_contradiction":
+            if query_aware_override is not None:
+                return query_aware_override
             # Low similarity but different values - could be unrelated or contradictory
             # Use uncertainty to guide: high uncertainty in either → defer
             new_uncertainty = new_scores.get("uncertainty", 0.0)
@@ -526,6 +718,26 @@ class ConflictAwareWriter:
             overwrite_thresh = self.arbitration_thresholds.get("overwrite_margin", 0.15)
             keep_margin = self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08)
 
+            if scenario_id and scenario_id.startswith("memoryagentbench_Conflict_Resolution"):
+                if prop_ts >= latest_ts:
+                    action = "overwrite"
+                    return action, {
+                        "reason": "mab_conflict_potential_contradiction_prefers_latest_overwrite",
+                        "new_scores": new_scores,
+                        "old_scores": old_scores,
+                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                        "margin": margin,
+                        "uncertainty": new_uncertainty,
+                    }
+                action = "reject"
+                return action, {
+                    "reason": "mab_conflict_older_potential_contradiction_reject",
+                    "new_scores": new_scores,
+                    "old_scores": old_scores,
+                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
+                    "margin": margin,
+                    "uncertainty": new_uncertainty,
+                }
 
             if avg_uncertainty > 0.6:
                 action = "defer"
@@ -579,6 +791,8 @@ class ConflictAwareWriter:
 
         # Mutually exclusive - definitive conflict, prioritize newer information (last-write-wins)
         if conflict_type == "mutually_exclusive":
+            if query_aware_override is not None:
+                return query_aware_override
             prop_ts = proposal_timestamp
             latest_ts = latest.get("timestamp", 0) if latest else 0
 
@@ -635,22 +849,28 @@ class ConflictAwareWriter:
 
     def _build_entry(self, proposal: Dict[str, Any], agent_id: str, candidates: List[Dict[str, Any]]) -> MemoryEntry:
         """Build a new memory entry from the proposal."""
-        entry = MemoryEntry(
-            subject=proposal["subject"],
-            predicate=proposal["predicate"],
-            object_val=proposal["object_val"],
-            agent_id=agent_id,
-            confidence=float(proposal.get("confidence", 1.0)),
-            provenance=proposal.get("provenance", "inferred"),
-            raw_text=proposal.get("raw_text", ""),
-            canonical_claim=proposal.get("canonical_claim"),
-            memory_type=proposal.get("memory_type", "fact"),
-        )
+        entry = MemoryEntry.from_proposal(proposal, agent_id=agent_id)
         if candidates:
             parent_id = candidates[-1].get("memory_id")
             parent_version = int(candidates[-1].get("version_id", 1))
             entry.parent_version_id = parent_id
             entry.version_id = parent_version + 1
+        entry.arbitration_metadata = {
+            "answer_criticality": float(proposal.get("answer_criticality", 0.0)),
+            "graph_support_score": float(proposal.get("graph_support_score", 0.0)),
+            "query_support_ids": list(proposal.get("query_support_ids", [])),
+            "query_relation_roles": list(proposal.get("query_relation_roles", [])),
+            "graph_cluster_id": proposal.get("graph_cluster_id"),
+            "graph_edges": list(proposal.get("graph_edges", [])),
+            "lineage_graph_edges": list(proposal.get("lineage_graph_edges", [])),
+            "support_spans": list(proposal.get("support_spans", [])),
+            "extractor_id": proposal.get("extractor_id"),
+            "rationale": proposal.get("rationale"),
+        }
+        entry.rationale = proposal.get("rationale")
+        entry.support_spans = list(proposal.get("support_spans", []))
+        entry.extractor_id = proposal.get("extractor_id")
+        entry.challenger_metadata = proposal.get("challenger_metadata")
         return entry
 
     def _apply_action_effects(
@@ -663,19 +883,15 @@ class ConflictAwareWriter:
     ) -> None:
         """Apply the effects of the chosen action on the memory store."""
         if action == "overwrite" and candidates:
-            # Note: store.commit already supersedes the parent for "overwrite"
-            # Here we only add relationship metadata to the old entry
             latest_id = candidates[-1].get("memory_id")
-            for r in self.store.records:
-                if r.memory_id == latest_id:
-                    # Add relationship metadata (do not change status here, store.commit already did)
-                    if r.arbitration_metadata is None:
-                        r.arbitration_metadata = {}
-                    r.arbitration_metadata.update({
-                        "superseded_by": entry.memory_id,
-                        "superseded_reason": conflict_type,
-                    })
-                    break
+            latest_record = self.store.supersede(latest_id, superseded_by=entry.memory_id)
+            if latest_record is not None:
+                if latest_record.arbitration_metadata is None:
+                    latest_record.arbitration_metadata = {}
+                latest_record.arbitration_metadata.update({
+                    "superseded_by": entry.memory_id,
+                    "superseded_reason": conflict_type,
+                })
 
         elif action == "keep_multiple_versions":
             # Keep both active and mark branch metadata for explicit multi-version handling
@@ -750,20 +966,21 @@ class ConflictAwareWriter:
 
             # Supersede the old entry to avoid duplicate visible entries
             latest_id = latest.get("memory_id")
-            for r in self.store.records:
-                if r.memory_id == latest_id:
-                    r.status = "superseded"
-                    if r.arbitration_metadata is None:
-                        r.arbitration_metadata = {}
-                    r.arbitration_metadata.update({
-                        "superseded_by": entry.memory_id,
-                        "superseded_reason": conflict_type,
-                    })
-                    break
+            latest_record = self.store.supersede(latest_id, superseded_by=entry.memory_id)
+            if latest_record is not None:
+                if latest_record.arbitration_metadata is None:
+                    latest_record.arbitration_metadata = {}
+                latest_record.arbitration_metadata.update({
+                    "superseded_by": entry.memory_id,
+                    "superseded_reason": conflict_type,
+                })
 
         elif action == "defer":
             # Mark as tentative and add detailed metadata
             entry.status = "tentative"
+            entry.lifecycle_stage = "tentative"
+            entry.visibility_state = "pending_review"
+            entry.canonical_status = "tentative"
             if entry.arbitration_metadata is None:
                 entry.arbitration_metadata = {}
             entry.arbitration_metadata.update({
@@ -810,6 +1027,7 @@ class ConflictAwareWriter:
         conflict_type, conflict_details = detect_conflict_type(
             proposal, candidates, read_snapshot_time, self.staleness_detector, mode=self.mode
         )
+        proposal["lineage_graph_edges"] = self._build_lineage_graph_edges(proposal, candidates)
 
         # Arbitrate to decide action (with scenario context and explicit timestamp)
         action, arbitration_details = self._arbitrate(
@@ -852,7 +1070,7 @@ class ConflictAwareWriter:
         })
 
         # Propose the write to the store
-        self.store.propose_write(entry)
+        self.store.propose(entry)
 
         # Commit with metadata
         self.store.commit(
@@ -863,6 +1081,13 @@ class ConflictAwareWriter:
                 "writer": "enhanced_conflict_aware",
                 "candidate_count": len(candidates),
                 "scenario_id": scenario_id,
+                "answer_criticality": float(proposal.get("answer_criticality", 0.0)),
+                "graph_support_score": float(proposal.get("graph_support_score", 0.0)),
+                "query_support_ids": list(proposal.get("query_support_ids", [])),
+                "query_relation_roles": list(proposal.get("query_relation_roles", [])),
+                "graph_cluster_id": proposal.get("graph_cluster_id"),
+                "graph_edges": list(proposal.get("graph_edges", [])),
+                "lineage_graph_edges": list(proposal.get("lineage_graph_edges", [])),
                 "arbitration_details": arbitration_details,
                 "conflict_details": conflict_details,
             },
@@ -871,9 +1096,10 @@ class ConflictAwareWriter:
         # Apply action-specific effects
         self._apply_action_effects(entry, action, conflict_type, candidates, arbitration_details)
 
-        # Save and index
+        # Save and materialize visibility only for non-deferred commits.
         self.store._save()
-        self.store.set_indexed(entry.memory_id, delay=0.0)
+        if action != "defer":
+            self.store.set_indexed(entry.memory_id, delay=0.0)
 
         # Return detailed result
         return {

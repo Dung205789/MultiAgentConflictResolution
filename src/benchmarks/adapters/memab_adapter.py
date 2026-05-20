@@ -56,10 +56,13 @@ class MemABAdapter:
         lines = context.split('\n')
 
         for line in lines:
-            # Match pattern: "0. Subject predicate object."
-            match = re.match(r'\s*\d+\.\s+(.+?)(?:\.|$)', line.strip())
+            # Keep the full line instead of truncating at the first "."
+            # inside abbreviations or initials.
+            match = re.match(r'^\s*\d+\.\s+(.*)$', line.strip())
             if match:
                 fact_text = match.group(1).strip()
+                if fact_text.endswith("."):
+                    fact_text = fact_text[:-1].rstrip()
                 # Simple parsing: split by first verb-like pattern
                 # This is a simplified parser - a real one would need NLP
                 # For now, keep the whole text as a fact
@@ -80,6 +83,20 @@ class MemABAdapter:
             return "unknown", "raw_statement", text
 
         # Pattern matching for common fact formats
+        direct_patterns = [
+            (r"^The original language of (.+?) is (.+?)$", "language"),
+            (r"^The original broadcaster of (.+?) is (.+?)$", "original_broadcaster"),
+            (r"^The origianl broadcaster of (.+?) is (.+?)$", "original_broadcaster"),
+            (r"^The head coach of (.+?) is (.+?)$", "head_coach"),
+            (r"^The President of (.+?) is (.+?)$", "head_of_state"),
+            (r"^The Governor of (.+?) is (.+?)$", "governor"),
+            (r"^The Mayor of (.+?) is (.+?)$", "mayor"),
+        ]
+        for pattern, predicate in direct_patterns:
+            match = re.match(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1).strip(), predicate, match.group(2).strip()
+
         # "X was born in Y", "X lives in Y", "X works at Y", etc.
         verb_patterns = {
             r'\b(was|is|are|were)\s+born\s+in\b': ('birth_place', 2),

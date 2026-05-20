@@ -5,7 +5,7 @@ Main entry point for multi-agent memory conflict resolution evaluation.
 This unified runner supports:
 - Multiple benchmarks (MemAE, MemoryAgentBench, LoCoMo, custom)
 - All writer modes (conflict_aware, lww, naive)
-- Adapter-structured fast mode and optional model-based re-extraction
+- Primary `oracle_structured` track and secondary `end_to_end_extract` track
 - Comprehensive evaluation with detailed metrics
 
 Usage examples:
@@ -41,7 +41,19 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
 
 from src.evaluation.run_evaluation import run_evaluation_with_scenarios
+from src.evaluation.run_evaluation import finalize_report_from_scenario_artifacts
 from src.benchmarks.unified_loader import load_benchmark, save_scenarios_to_jsonl
+from src.benchmarks.scenario_contract import scenario_to_dict
+
+
+VALID_RESULT_MODES = {
+    "conflict_aware",
+    "conflict_aware_full",
+    "conflict_aware_no_lineage_edges",
+    "conflict_aware_no_query_support",
+    "lww",
+    "naive",
+}
 
 
 def resolve_execution_device(preference: str) -> str:
@@ -73,8 +85,18 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
         raise ValueError("`--use-dummy` cannot be combined with `--agent1-model` or `--agent2-model`.")
 
     use_model_reextract = bool(args.agent1_model or args.agent2_model)
-    proposal_source = "agent_extract" if use_model_reextract else "structured"
-    strict_agent_execution = use_model_reextract
+    requested_track = args.track
+    if requested_track is None:
+        requested_track = "end_to_end_extract" if use_model_reextract else "oracle_structured"
+
+    if requested_track == "end_to_end_extract" and not use_model_reextract:
+        raise ValueError("`--track end_to_end_extract` requires `--agent1-model` and/or `--agent2-model`.")
+
+    if requested_track == "oracle_structured" and use_model_reextract:
+        raise ValueError("Model re-extraction cannot run under `--track oracle_structured`.")
+
+    proposal_source = "agent_extract" if requested_track == "end_to_end_extract" else "structured"
+    strict_agent_execution = requested_track == "end_to_end_extract"
     resolved_device = resolve_execution_device(args.device)
     cuda_device_count = detect_cuda_device_count() if resolved_device == "cuda" else 0
     primary_device = "cpu"
@@ -113,13 +135,38 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
         agent_configs["__slot_0__"]["model_type"] = "structured"
         agent_configs["__slot_1__"]["model_type"] = "structured"
 
+    selected_modes = None
+    if args.modes:
+        selected_modes = [item.strip() for item in args.modes.split(",") if item.strip()]
+        invalid = [item for item in selected_modes if item not in VALID_RESULT_MODES]
+        if invalid:
+            raise ValueError(f"Unsupported values in --modes: {', '.join(invalid)}")
+        if args.include_conflict_aware_ablations:
+            if "conflict_aware" in selected_modes:
+                raise ValueError("When --include-conflict-aware-ablations is set, use ablation result keys such as conflict_aware_full instead of conflict_aware in --modes.")
+        else:
+            disallowed = {
+                "conflict_aware_full",
+                "conflict_aware_no_lineage_edges",
+                "conflict_aware_no_query_support",
+            } & set(selected_modes)
+            if disallowed:
+                raise ValueError("Ablation-only mode keys require --include-conflict-aware-ablations.")
+
     return {
         "proposal_source": proposal_source,
         "strict_agent_execution": strict_agent_execution,
+        "track_name": requested_track,
         "agent_configs": agent_configs,
         "device": resolved_device,
         "cuda_device_count": cuda_device_count,
-        "mode_label": "dummy_structured" if args.use_dummy or not use_model_reextract else "transformer_reextract",
+        "mode_label": requested_track,
+        "conflict_aware_variant": args.conflict_aware_variant,
+        "include_conflict_aware_ablations": args.include_conflict_aware_ablations,
+        "enable_error_analysis": args.enable_error_analysis,
+        "emit_scenario_bundles": args.emit_scenario_bundles,
+        "allow_structured_fallback_in_end_to_end": args.allow_structured_fallback_in_end_to_end,
+        "selected_modes": selected_modes,
     }
 
 
@@ -144,13 +191,40 @@ def run_evaluation_pipeline(
     print("\n" + "="*70)
     print(f"RESULTS FOR {benchmark_name.upper()}")
     print("="*70)
-    for mode in ["conflict_aware", "lww", "naive"]:
+    ordered_modes = [
+        "conflict_aware",
+        "conflict_aware_full",
+        "conflict_aware_no_lineage_edges",
+        "conflict_aware_no_query_support",
+        "lww",
+        "naive",
+    ]
+    printed = set()
+    for mode in ordered_modes:
+        if mode == "conflict_aware" and "conflict_aware_full" in report["results"]:
+            continue
         if mode in report["results"]:
             res = report["results"][mode]
+            if mode in printed:
+                continue
+            printed.add(mode)
             print(f"{mode:17} | Acc: {res['scenario_accuracy']:.3f} | "
                   f"F1: {res['conflict_f1']:.3f} | "
                   f"Action: {res['action_accuracy']:.3f} | "
                   f"Mem F1: {res['final_memory_f1']:.3f}")
+            if res.get("qa_total", 0):
+                print(
+                    f"{'':17}   QA-EM: {res.get('qa_exact_match', 0.0):.3f} | "
+                    f"QA-SubEM: {res.get('qa_subem', 0.0):.3f}"
+                )
+            if res.get("fc_sh_total", 0) or res.get("fc_mh_total", 0):
+                print(
+                    f"{'':17}   FC-SH: {res.get('fc_sh_accuracy', 0.0):.3f} "
+                    f"({res.get('fc_sh_correct', 0)}/{res.get('fc_sh_total', 0)}) | "
+                    f"FC-MH: {res.get('fc_mh_accuracy', 0.0):.3f} "
+                    f"({res.get('fc_mh_correct', 0)}/{res.get('fc_mh_total', 0)}) | "
+                    f"Unmatched: {res.get('fc_unmatched_total', 0)}"
+                )
 
     return report
 
@@ -217,7 +291,14 @@ def main():
     parser.add_argument(
         "--use-dummy",
         action="store_true",
-        help="Fast accepted-benchmark mode: use adapter-structured proposals and apply reliability priors without model re-extraction"
+        help="Legacy alias for the primary `oracle_structured` track. Structured benchmark proposals are used without model re-extraction."
+    )
+    parser.add_argument(
+        "--track",
+        type=str,
+        default=None,
+        choices=["oracle_structured", "end_to_end_extract"],
+        help="Research-facing execution track. Omit to infer from legacy flags."
     )
     parser.add_argument(
         "--agent1-model",
@@ -229,7 +310,7 @@ def main():
         "--agent2-model",
         type=str,
         default=None,
-        help="Optional local transformer model for agent 2. When set, the runner re-extracts proposals from raw benchmark text."
+        help="Optional local transformer model for agent 2. When set, the runner can execute the secondary `end_to_end_extract` track."
     )
     parser.add_argument(
         "--agent1-reliability",
@@ -249,6 +330,45 @@ def main():
         default="auto",
         choices=["auto", "cpu", "cuda"],
         help="Device for transformer agents. `auto` uses CUDA when available."
+    )
+    parser.add_argument(
+        "--conflict-aware-variant",
+        type=str,
+        default="full",
+        choices=["full", "no_lineage_edges", "no_query_support"],
+        help="Conflict-aware symbolic variant to run when ablations are not expanded."
+    )
+    parser.add_argument(
+        "--include-conflict-aware-ablations",
+        action="store_true",
+        help="Run conflict-aware full plus no-lineage and no-query-support ablations alongside LWW and naive."
+    )
+    parser.add_argument(
+        "--enable-error-analysis",
+        action="store_true",
+        help="Emit QA error-analysis artifacts for benchmark runs that include queries."
+    )
+    parser.add_argument(
+        "--emit-scenario-bundles",
+        action="store_true",
+        help="Emit per-scenario JSON artifacts with final visible state, QA failures, and conflict decisions."
+    )
+    parser.add_argument(
+        "--allow-structured-fallback-in-end-to-end",
+        action="store_true",
+        help="Allow explicit structured fallback when extraction fails. This is labeled separately and must not be reported as pure end-to-end extraction."
+    )
+    parser.add_argument(
+        "--modes",
+        type=str,
+        default=None,
+        help="Optional comma-separated subset of result modes to run, e.g. conflict_aware,lww or conflict_aware_full,lww."
+    )
+    parser.add_argument(
+        "--finalize-report-from-artifacts",
+        type=str,
+        default=None,
+        help="Recover and write the final report at the given report path by rebuilding it from .partial.json and .scenarios artifacts."
     )
 
     # Output options
@@ -360,18 +480,11 @@ def main():
                     print(f"  Cached to {cache_path}")
 
             # Show sample info
-            s = scenarios[0]
-            # Handle both Scenario objects and dicts
-            if hasattr(s, 'scenario_id'):
-                sid = s.scenario_id
-                stype = s.scenario_type
-                nevents = len(s.ordered_events)
-                nqueries = len(s.queries)
-            else:
-                sid = s.get('scenario_id', 'unknown')
-                stype = s.get('scenario_type', 'unknown')
-                nevents = len(s.get('ordered_events', []))
-                nqueries = len(s.get('queries', []))
+            s = scenario_to_dict(scenarios[0])
+            sid = s.get('scenario_id', 'unknown')
+            stype = s.get('scenario_type', 'unknown')
+            nevents = len(s.get('ordered_events', []))
+            nqueries = len(s.get('queries', []))
             print(f"  Sample: ID={sid}, Type={stype}")
             print(f"  Events={nevents}, Queries={nqueries}")
 
@@ -379,21 +492,28 @@ def main():
             if len(scenarios) > 1:
                 type_dist = {}
                 for scen in scenarios:
-                    if hasattr(scen, 'scenario_type'):
-                        t = scen.scenario_type
-                    else:
-                        t = scen.get('scenario_type', 'unknown')
+                    t = scenario_to_dict(scen).get('scenario_type', 'unknown')
                     type_dist[t] = type_dist.get(t, 0) + 1
                 print(f"  Types: {type_dist}")
 
-            # Run evaluation
-            print(f"\nRunning evaluation on {len(scenarios)} scenarios...")
-            report = run_evaluation_pipeline(
-                scenarios=scenarios,
-                benchmark_name=benchmark_name,
-                output_dir=args.output_dir,
-                execution_config=execution_config,
-            )
+            if args.finalize_report_from_artifacts:
+                print(f"\nFinalizing report from artifacts: {args.finalize_report_from_artifacts}")
+                report = finalize_report_from_scenario_artifacts(
+                    scenarios=scenarios,
+                    benchmark_name=benchmark_name,
+                    output_path=args.finalize_report_from_artifacts,
+                    execution_config=execution_config,
+                )
+                print(f"[OK] Recovered final report to {args.finalize_report_from_artifacts}")
+            else:
+                # Run evaluation
+                print(f"\nRunning evaluation on {len(scenarios)} scenarios...")
+                report = run_evaluation_pipeline(
+                    scenarios=scenarios,
+                    benchmark_name=benchmark_name,
+                    output_dir=args.output_dir,
+                    execution_config=execution_config,
+                )
             all_reports[benchmark_name] = report
 
         except Exception as e:

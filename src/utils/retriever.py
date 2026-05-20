@@ -109,33 +109,48 @@ def _build_memory_text(m: Dict) -> str:
 
 def _dict_to_memory_entry(mem_dict: Dict[str, Any]) -> MemoryEntry:
     """Convert a dictionary to a MemoryEntry object for lifecycle scoring."""
-    entry = MemoryEntry(
-        subject=mem_dict.get("subject", ""),
-        predicate=mem_dict.get("predicate", ""),
-        object_val=mem_dict.get("object_val", ""),
-        agent_id=mem_dict.get("agent_id", "unknown"),
-        confidence=float(mem_dict.get("confidence", 0.5)),
-        provenance=mem_dict.get("provenance", "inferred"),
-        raw_text=mem_dict.get("raw_text", ""),
-        canonical_claim=mem_dict.get("canonical_claim"),
-        memory_type=mem_dict.get("memory_type", "fact"),
-        event_time=mem_dict.get("event_time"),
-        ingestion_time=mem_dict.get("ingestion_time"),
-        valid_from=mem_dict.get("valid_from"),
-        valid_until=mem_dict.get("valid_until"),
-        session_id=mem_dict.get("session_id"),
-        turn_index=mem_dict.get("turn_index"),
-        recall_count=int(mem_dict.get("recall_count", 0)),
-        last_recalled_at=mem_dict.get("last_recalled_at"),
-        supersedes=mem_dict.get("supersedes"),
-        merged_from=mem_dict.get("merged_from", []),
-        conflicts_with=mem_dict.get("conflicts_with"),
-        canonical_status=mem_dict.get("canonical_status", "tentative")
+    entry = MemoryEntry.from_dict(
+        {
+            "subject": mem_dict.get("subject", ""),
+            "predicate": mem_dict.get("predicate", ""),
+            "object_val": mem_dict.get("object_val", ""),
+            "agent_id": mem_dict.get("agent_id", "unknown"),
+            "confidence": float(mem_dict.get("confidence", 0.5)),
+            "provenance": mem_dict.get("provenance", "inferred"),
+            "raw_text": mem_dict.get("raw_text", ""),
+            "canonical_claim": mem_dict.get("canonical_claim"),
+            "memory_type": mem_dict.get("memory_type", "fact"),
+            "status": mem_dict.get("status", "active"),
+            "lifecycle_stage": mem_dict.get("lifecycle_stage", "committed"),
+            "visibility_state": mem_dict.get("visibility_state", "visible"),
+            "canonical_status": mem_dict.get("canonical_status"),
+            "timestamp": mem_dict.get("timestamp"),
+            "event_time": mem_dict.get("event_time"),
+            "ingestion_time": mem_dict.get("ingestion_time"),
+            "committed_at": mem_dict.get("committed_at"),
+            "indexed_at": mem_dict.get("indexed_at"),
+            "valid_from": mem_dict.get("valid_from"),
+            "valid_until": mem_dict.get("valid_until"),
+            "session_id": mem_dict.get("session_id"),
+            "turn_index": mem_dict.get("turn_index"),
+            "recall_count": int(mem_dict.get("recall_count", 0)),
+            "last_recalled_at": mem_dict.get("last_recalled_at"),
+            "version_id": int(mem_dict.get("version_id", 1)),
+            "parent_version_id": mem_dict.get("parent_version_id"),
+            "supersedes": mem_dict.get("supersedes"),
+            "merged_from": mem_dict.get("merged_from", []),
+            "conflicts_with": mem_dict.get("conflicts_with"),
+            "resolution_action": mem_dict.get("resolution_action"),
+            "conflict_type": mem_dict.get("conflict_type"),
+            "arbitration_metadata": mem_dict.get("arbitration_metadata"),
+            "rationale": mem_dict.get("rationale"),
+            "support_spans": mem_dict.get("support_spans", []),
+            "extractor_id": mem_dict.get("extractor_id"),
+            "challenger_metadata": mem_dict.get("challenger_metadata"),
+            "memory_id": mem_dict.get("memory_id"),
+            "entity_id": mem_dict.get("entity_id"),
+        }
     )
-    # Set timestamps
-    entry.timestamp = mem_dict.get("timestamp", entry.timestamp)
-    entry.committed_at = mem_dict.get("committed_at", entry.committed_at)
-    entry.indexed_at = mem_dict.get("indexed_at", entry.indexed_at)
     # Optional embedding - skip if not present
     if "embedding" in mem_dict:
         entry.embedding = mem_dict["embedding"]
