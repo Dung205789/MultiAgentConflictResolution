@@ -46,6 +46,27 @@
 | conflict_aware | 0.87500 | 0.87500 | 1.00000 | 0.86667 | 1.000 | 1.000 |
 | lww | 0.79500 | 0.79500 | 0.81250 | 0.79330 | 1.000 | 1.000 |
 
+## Pre-LLM Hardening Freeze
+- Sources:
+  - `reports/paper_mode_mab2_prellm_hardening_v1/mab_conflict_report.json`
+  - `reports/paper_mode_mab2_prellm_ablation_v1/mab_conflict_report.json`
+- Purpose:
+  - freeze the symbolic code-state before expensive `end_to_end_extract` LLM runs
+  - verify that the latest generalization sweep does not regress benchmark correctness
+  - re-check that `query-aware` still beats `no_query_support` after rule and QA hardening
+
+| Mode | QA-EM | QA-SubEM | FC-SH | FC-MH | Scenario Acc | Action Acc |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| conflict_aware_full | 0.87500 | 0.87500 | 1.00000 | 0.86667 | 1.000 | 1.000 |
+| conflict_aware_no_lineage_edges | 0.87500 | 0.87500 | 1.00000 | 0.86667 | 1.000 | 1.000 |
+| conflict_aware_no_query_support | 0.80000 | 0.80000 | 0.87500 | 0.79444 | 1.000 | 1.000 |
+| lww | 0.80000 | 0.80000 | 0.87500 | 0.79444 | 1.000 | 1.000 |
+
+- Code-state changes in this freeze:
+  - generalized overwrite-first handling for terse entity-slot conflicts in `src/conflict/conflict_aware_writer.py`
+  - stronger anchor inference, edge deduplication, and relation-follow ranking in `src/evaluation/qa_reasoner.py`
+  - explicit query-aware graph edges now outrank lower-priority duplicate edges during answer-time traversal
+
 ## What The Repair Changed
 - The benchmark parser no longer truncates facts at the first `.` inside abbreviations or initials.
 - Example classes fixed:
@@ -83,6 +104,39 @@
   - `mab_conflict_report.json.scenarios/`
   - `python scripts/replay_qa_from_report.py <report>.scenarios`
   - `reported_track_name`, `pure_end_to_end_extract`, and `structured_fallback_present` in mode metrics
+
+## Secondary-Track Reading Discipline
+- Real-model `end_to_end_extract` reports now expose both:
+  - `raw_state_match` / `raw_memory_f1`
+  - `canonical_state_match` / `canonical_memory_f1`
+- Interpretation rule:
+  - treat `scenario_accuracy` as an alias of `canonical_state_match`
+  - treat `final_memory_f1` as an alias of `canonical_memory_f1`
+  - do not describe high secondary-track memory scores as raw-state-perfect unless `raw_state_match = 1.0`
+- Current CR rerun evidence shows why this matters:
+  - `s0`: `raw_state_match = 0.0`, `canonical_state_match = 1.0`
+  - `s4`: `raw_state_match = 0.0`, `canonical_state_match = 1.0`
+  - `s1`: `raw_state_match = 0.0`, `canonical_state_match = 0.0`, but `canonical_memory_f1 = 0.9996592845`
+  - `s2`: `raw_state_match = 0.0`, `canonical_state_match = 0.0`, but `canonical_memory_f1 = 0.9998263587`
+  - `s5`: `raw_state_match = 0.0`, `canonical_state_match = 0.0`, but `canonical_memory_f1 = 0.9996592845`
+- Therefore:
+  - the secondary track is not globally broken
+  - arbitration is usually holding up
+  - raw exactness is still materially below canonical exactness on the larger CR families
+  - QA bottlenecks still dominate the non-passing slices
+
+## Extra-Surface Contract Boundary
+- `LongMemEval` is not currently clean strict-`end_to_end_extract` evidence:
+  - loader emits `write_proposal` events with predicate `utterance`
+  - gold visible state is the utterance surface itself
+  - a strict extractor would be graded against a different state representation than what it is asked to produce
+- `LoCoMo` is not currently clean strict-`end_to_end_extract` evidence:
+  - loader writes conversation turns as `utterance` plus `session_date`
+  - gold visible state mixes `session_date` with `session_event` summaries
+  - strict extraction would again be evaluated against a mismatched target state surface
+- Conclusion:
+  - keep these surfaces as loader/runtime portability work for now
+  - do not use them as headline strict secondary evidence until the extraction target and gold-state contract are aligned
 
 ## Interpretation
 - The parser repair was worth doing:

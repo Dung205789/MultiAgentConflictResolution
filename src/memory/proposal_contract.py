@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from src.memory.canonicalization import canonicalize_memory_triplet
+
 
 PROPOSAL_ONLY_KEYS = {
     "subject",
@@ -58,5 +60,16 @@ def normalize_proposal(
         default_rationale or f"{source_label}_proposal",
     )
     normalized["challenger_metadata"] = normalized.get("challenger_metadata")
+    normalized["_original_predicate"] = normalized.get("predicate")
+
+    subject, predicate, object_val = canonicalize_memory_triplet(
+        normalized.get("subject", "unknown"),
+        normalized.get("predicate", "raw_statement"),
+        normalized.get("object_val", normalized.get("raw_text", "")),
+        raw_text=normalized.get("raw_text", ""),
+    )
+    normalized["subject"] = subject
+    normalized["predicate"] = predicate
+    normalized["object_val"] = object_val
     normalized["_proposal_contract"] = "proposal_only"
     return normalized

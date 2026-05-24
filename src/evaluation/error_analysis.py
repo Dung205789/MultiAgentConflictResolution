@@ -3,7 +3,7 @@ Structured QA error analysis for benchmark-facing symbolic runs.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Sequence, Tuple
 
 from src.benchmarks.scenario_contract import scenarios_to_dicts
 from src.evaluation.qa_reasoner import (
@@ -48,11 +48,56 @@ def _is_answer_type_compatible(predicted_type: Any, expected_types: Sequence[str
     return False
 
 
+def _follow_relation_chain(
+    graph: Dict[str, List[Any]],
+    anchor: Any,
+    relation_chain: Sequence[str],
+    *,
+    use_all_matching_edges: bool = False,
+) -> Tuple[bool, List[str]]:
+    anchor_node = _resolve_anchor_node(anchor, graph) if anchor else None
+    if not anchor_node:
+        return False, []
+    current_nodes = [anchor_node]
+    for relation in relation_chain:
+        if use_all_matching_edges:
+            next_nodes = []
+            for node in current_nodes:
+                for edge in graph.get(node, []):
+                    if edge.relation == relation:
+                        next_nodes.append(edge.target)
+            next_nodes = list(dict.fromkeys(next_nodes))
+        else:
+            next_nodes, _ = _follow_relation(graph, current_nodes, relation)
+        if not next_nodes:
+            return False, []
+        current_nodes = next_nodes
+    return True, current_nodes
+
+
+def _extract_event_memories(scenario_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    memories: List[Dict[str, Any]] = []
+    for event in scenario_dict.get("ordered_events", []):
+        proposal = event.get("proposal") or {}
+        if not proposal:
+            continue
+        memories.append(
+            {
+                "subject": proposal.get("subject"),
+                "predicate": proposal.get("predicate"),
+                "object_val": proposal.get("object_val"),
+                "raw_text": proposal.get("raw_text"),
+            }
+        )
+    return memories
+
+
 def _classify_single_failure(
     question: str,
     gold_answers: Sequence[Any],
     predicted_answers: Sequence[Any],
     memories: Sequence[Dict[str, Any]],
+    scenario_dict: Dict[str, Any],
     predicted_answer_type: Any = None,
 ) -> Dict[str, Any]:
     analysis = analyze_question_requirements(question)
@@ -75,9 +120,28 @@ def _classify_single_failure(
         "gold_answers": list(gold_answers or []),
     }
 
+    gold_state_graph, _, _ = build_memory_graph(scenario_dict.get("gold_visible_shared_state_after_commit", []))
+    event_graph, _, _ = build_memory_graph(_extract_event_memories(scenario_dict))
+
     if not relation_chain:
         detail["category"] = "wrong_anchor_resolution"
         detail["reason"] = "question_template_unmatched"
+        return detail
+
+    final_gold_chain_ok, final_gold_nodes = _follow_relation_chain(gold_state_graph, anchor, relation_chain)
+    event_chain_ok, event_nodes = _follow_relation_chain(
+        event_graph,
+        anchor,
+        relation_chain,
+        use_all_matching_edges=True,
+    )
+    final_gold_norm = {normalize_answer(node) for node in final_gold_nodes if normalize_answer(node)}
+    event_norm = {normalize_answer(node) for node in event_nodes if normalize_answer(node)}
+    if gold_norm and not (gold_norm & final_gold_norm) and (gold_norm & event_norm):
+        detail["category"] = "stale_query_state_mismatch"
+        detail["reason"] = "gold_answer_reachable_from_event_history_but_not_final_gold_state"
+        detail["final_gold_nodes"] = list(final_gold_nodes)
+        detail["event_history_nodes"] = list(event_nodes)
         return detail
 
     if anchor and not anchor_node:
@@ -182,6 +246,7 @@ def build_error_analysis_report(
                     qa_item.get("gold", []),
                     qa_item.get("predicted_answers", []),
                     final_visible,
+                    scenario_dict,
                     qa_item.get("answer_type"),
                 )
                 summary_counts[classified["category"]] = summary_counts.get(classified["category"], 0) + 1

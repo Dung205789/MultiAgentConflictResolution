@@ -7,9 +7,67 @@ import time
 from abc import ABC, abstractmethod
 import os
 import json
+import hashlib
 import re
+import socket
+import threading
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+from src.memory.canonicalization import (
+    canonicalize_memory_triplet,
+    canonicalize_object_value as canonicalize_slot_object_value,
+    canonicalize_predicate_name as canonicalize_slot_predicate_name,
+)
 
 _PIPELINE_CACHE: Dict[tuple, Any] = {}
+_API_LAST_CALL: Dict[str, float] = {}
+_EXTRACTION_CACHE_REGISTRY: Dict[str, "_PersistentExtractionCache"] = {}
+
+
+def _load_env_value(key: str) -> Optional[str]:
+    def _is_placeholder(raw: Optional[str]) -> bool:
+        text = str(raw or "").strip().lower()
+        return text in {
+            "",
+            "your-api-key",
+            "your_openai_api_key_here",
+            "your_gemini_api_key_here",
+            "your_huggingface_token_here",
+        }
+
+    value = os.getenv(key)
+    if value and not _is_placeholder(value):
+        return value.strip()
+
+    project_root = Path(__file__).resolve().parents[2]
+    for candidate in (project_root / ".env", project_root / ".env.example"):
+        if not candidate.exists():
+            continue
+        try:
+            for raw_line in candidate.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                lhs, rhs = line.split("=", 1)
+                lhs = lhs.lstrip("\ufeff")
+                if lhs.strip() == key:
+                    parsed = rhs.strip().strip("\"' ")
+                    if parsed and not _is_placeholder(parsed):
+                        os.environ[key] = parsed
+                        return parsed
+        except Exception:
+            continue
+    return None
+
+
+def _canonicalize_predicate(predicate: str, object_val: str) -> str:
+    return canonicalize_slot_predicate_name(predicate)
+
+
+def _canonicalize_object_value(predicate: str, object_val: str) -> str:
+    return str(canonicalize_slot_object_value(object_val))
 
 
 def _resolve_pipeline_device(device: str) -> Tuple[int, bool]:
@@ -25,6 +83,146 @@ def _resolve_pipeline_device(device: str) -> Tuple[int, bool]:
         except ValueError:
             return 0, True
     return 0, True
+
+
+def _clone_json_value(value: Any) -> Any:
+    return json.loads(json.dumps(value, ensure_ascii=False))
+
+
+class _PersistentExtractionCache:
+    """Append-only JSONL cache for extracted write proposals."""
+
+    def __init__(self, cache_path: str):
+        self.cache_path = Path(cache_path).resolve()
+        self._loaded = False
+        self._entries: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+
+    def _ensure_loaded(self) -> None:
+        if self._loaded:
+            return
+
+        with self._lock:
+            if self._loaded:
+                return
+            if self.cache_path.exists():
+                with self.cache_path.open("r", encoding="utf-8") as f:
+                    for raw_line in f:
+                        line = raw_line.strip()
+                        if not line:
+                            continue
+                        try:
+                            payload = json.loads(line)
+                        except Exception:
+                            continue
+                        cache_key = str(payload.get("key", "")).strip()
+                        items = payload.get("items")
+                        if cache_key and isinstance(items, list):
+                            self._entries[cache_key] = payload
+            self._loaded = True
+
+    def get_items(self, cache_key: str) -> Optional[List[Dict[str, Any]]]:
+        self._ensure_loaded()
+        payload = self._entries.get(cache_key)
+        if not payload:
+            return None
+        return _clone_json_value(payload.get("items", []))
+
+    def put_items(self, payload: Dict[str, Any]) -> None:
+        cache_key = str(payload.get("key", "")).strip()
+        items = payload.get("items")
+        if not cache_key or not isinstance(items, list):
+            return
+
+        self._ensure_loaded()
+        with self._lock:
+            self.cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.cache_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            self._entries[cache_key] = _clone_json_value(payload)
+
+
+def _get_persistent_extraction_cache(cache_path: Optional[str]) -> Optional[_PersistentExtractionCache]:
+    if not cache_path:
+        return None
+    resolved = str(Path(cache_path).resolve())
+    cache = _EXTRACTION_CACHE_REGISTRY.get(resolved)
+    if cache is None:
+        cache = _PersistentExtractionCache(resolved)
+        _EXTRACTION_CACHE_REGISTRY[resolved] = cache
+    return cache
+
+
+class ExtractionCacheMixin:
+    """Shared persistent cache helpers for real extraction agents."""
+
+    EXTRACTION_PROMPT_VERSION = "extract_v1"
+
+    def _init_extraction_cache(self, extraction_cache_path: Optional[str]) -> None:
+        self.extraction_cache_path = str(Path(extraction_cache_path).resolve()) if extraction_cache_path else None
+        self.extraction_cache = _get_persistent_extraction_cache(self.extraction_cache_path)
+        self.cache_hits = 0
+        self.cache_misses = 0
+        self.cache_writes = 0
+
+    def _build_extraction_cache_key(self, text: str) -> Optional[str]:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return None
+        payload = {
+            "model_name": self.model_name,
+            "prompt_version": self.EXTRACTION_PROMPT_VERSION,
+            "raw_text": normalized,
+        }
+        return hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+
+    def _load_cached_extraction(self, text: str) -> Optional[List[Dict[str, Any]]]:
+        if self.extraction_cache is None:
+            return None
+        cache_key = self._build_extraction_cache_key(text)
+        if not cache_key:
+            return None
+        cached = self.extraction_cache.get_items(cache_key)
+        if cached is not None:
+            self.cache_hits += 1
+            return cached
+        self.cache_misses += 1
+        return None
+
+    def _store_cached_extraction(
+        self,
+        text: str,
+        items: List[Dict[str, Any]],
+        *,
+        raw_response: str = "",
+    ) -> None:
+        if self.extraction_cache is None or not items:
+            return
+        cache_key = self._build_extraction_cache_key(text)
+        if not cache_key:
+            return
+        self.extraction_cache.put_items(
+            {
+                "key": cache_key,
+                "model_name": self.model_name,
+                "prompt_version": self.EXTRACTION_PROMPT_VERSION,
+                "raw_text": str(text),
+                "items": items,
+                "raw_response": raw_response,
+                "cached_at": time.time(),
+            }
+        )
+        self.cache_writes += 1
+
+    def get_extraction_cache_stats(self) -> Dict[str, Any]:
+        return {
+            "cache_path": self.extraction_cache_path,
+            "cache_hits": self.cache_hits,
+            "cache_misses": self.cache_misses,
+            "cache_writes": self.cache_writes,
+        }
 
 
 class LocalAgent(ABC):
@@ -114,8 +312,10 @@ class DummyLocalAgent(LocalAgent):
         return memories
 
 
-class TransformerAgent(LocalAgent):
+class TransformerAgent(ExtractionCacheMixin, LocalAgent):
     """Agent that uses a local transformer model for generation and extraction."""
+    EXTRACTION_PROMPT_VERSION = "transformer_extract_v1"
+
     def __init__(
         self,
         agent_id: str,
@@ -123,6 +323,7 @@ class TransformerAgent(LocalAgent):
         device: str = "cpu",
         quantization_mode: Optional[str] = None,
         strict_loading: bool = False,
+        extraction_cache_path: Optional[str] = None,
     ):
         super().__init__(agent_id, model_name)
         self.device = device
@@ -130,6 +331,7 @@ class TransformerAgent(LocalAgent):
         self.strict_loading = strict_loading
         self.generator = None
         self.last_extraction_response: str = ""
+        self._init_extraction_cache(extraction_cache_path)
         self._load_model()
 
     def _load_model(self):
@@ -211,6 +413,9 @@ class TransformerAgent(LocalAgent):
 
     def extract_memories(self, text: str) -> List[Dict[str, Any]]:
         """Extract memories using the local model with a prompting approach."""
+        cached = self._load_cached_extraction(text)
+        if cached is not None:
+            return cached
         if self.generator is None:
             return []
 
@@ -229,7 +434,10 @@ class TransformerAgent(LocalAgent):
         try:
             response = self.generate_response(prompt, max_new_tokens=96)
             self.last_extraction_response = response or ""
-            return self._parse_extraction_response(response, text)
+            items = self._parse_extraction_response(response, text)
+            if items:
+                self._store_cached_extraction(text, items, raw_response=response or "")
+            return items
         except Exception:
             pass
 
@@ -291,9 +499,12 @@ class TransformerAgent(LocalAgent):
     def _normalize_extracted_item(self, item: Any, source_text: str) -> Optional[Dict[str, Any]]:
         if not isinstance(item, dict):
             return None
-        subject = str(item.get("subject", "unknown")).strip()
-        predicate = str(item.get("predicate", "")).strip()
-        object_val = str(item.get("object_val", item.get("object", ""))).strip()
+        subject, predicate, object_val = canonicalize_memory_triplet(
+            item.get("subject", "unknown"),
+            item.get("predicate", ""),
+            item.get("object_val", item.get("object", "")),
+            raw_text=source_text,
+        )
         if not predicate or not object_val:
             return None
         try:
@@ -313,6 +524,277 @@ class TransformerAgent(LocalAgent):
             "challenger_metadata": item.get("challenger_metadata", None),
         }
         return normalized
+
+
+class GeminiAPIAgent(ExtractionCacheMixin, LocalAgent):
+    """Agent that uses the Gemini REST API for extraction."""
+    EXTRACTION_PROMPT_VERSION = "gemini_extract_v1"
+
+    def __init__(
+        self,
+        agent_id: str,
+        model_name: str,
+        strict_loading: bool = False,
+        extraction_cache_path: Optional[str] = None,
+    ):
+        super().__init__(agent_id, model_name)
+        self.strict_loading = strict_loading
+        self.api_key = _load_env_value("GEMINI_API_KEY")
+        self.api_base = _load_env_value("GEMINI_API_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/models"
+        self.min_interval_seconds = float(_load_env_value("GEMINI_MIN_INTERVAL_SECONDS") or "7")
+        self.last_extraction_response: str = ""
+        self._init_extraction_cache(extraction_cache_path)
+        if self.strict_loading and not self.api_key:
+            raise RuntimeError("GEMINI_API_KEY is required for Gemini API extraction.")
+
+    def generate_response(self, prompt: str, **kwargs) -> str:
+        if not self.api_key:
+            return ""
+
+        url = f"{self.api_base}/{self.model_name}:generateContent"
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseMimeType": "application/json",
+            },
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": self.api_key,
+            },
+            method="POST",
+        )
+
+        last_error: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                self._wait_for_rate_limit()
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    content = response.read().decode("utf-8", errors="replace")
+                _API_LAST_CALL[self.model_name] = time.time()
+                payload = json.loads(content)
+                parts = payload.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                text = "".join(str(part.get("text", "")) for part in parts)
+                return text.strip()
+            except urllib.error.HTTPError as exc:
+                error_body = ""
+                try:
+                    error_body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    error_body = ""
+                last_error = RuntimeError(f"HTTP {exc.code}: {error_body or exc.reason}")
+                if exc.code not in {429, 500, 502, 503, 504}:
+                    break
+                sleep_seconds = self._retry_delay_seconds(error_body) or max(self.min_interval_seconds, 2 ** attempt)
+                time.sleep(sleep_seconds)
+                continue
+            except Exception as exc:
+                last_error = exc
+            time.sleep(max(self.min_interval_seconds, 2 ** attempt))
+
+        if self.strict_loading and last_error is not None:
+            raise RuntimeError(f"Gemini API request failed: {last_error}") from last_error
+        return ""
+
+    def extract_memories(self, text: str) -> List[Dict[str, Any]]:
+        cached = self._load_cached_extraction(text)
+        if cached is not None:
+            return cached
+        prompt = (
+            "Extract structured facts from the input text.\n"
+            "Return ONLY JSON, preferably a JSON array. A single JSON object is also acceptable.\n"
+            "Each item must contain keys: subject, predicate, object_val, confidence, provenance, rationale, support_spans, extractor_id.\n"
+            "Preserve explicit entities and relation names from the input when possible.\n"
+            "Use provenance='llm_inferred'. Confidence must be between 0.5 and 0.95.\n"
+            "Example Input: Thomas Kyd was born in the city of London\n"
+            f"Example Output: [{{\"subject\":\"Thomas Kyd\",\"predicate\":\"birth_place\",\"object_val\":\"London\",\"confidence\":0.9,"
+            "\"provenance\":\"llm_inferred\",\"rationale\":\"direct stated fact\","
+            "\"support_spans\":[{\"span_text\":\"Thomas Kyd was born in the city of London\",\"span_index\":0}],"
+            f"\"extractor_id\":\"{self.model_name}\"}}]\n"
+            f"Input: {text}\n"
+            "Output JSON:"
+        )
+        response = self.generate_response(prompt)
+        self.last_extraction_response = response or ""
+        parser = TransformerAgent.__new__(TransformerAgent)
+        parser.model_name = self.model_name
+        items = TransformerAgent._parse_extraction_response(parser, response, text)
+        if items:
+            self._store_cached_extraction(text, items, raw_response=response or "")
+        return items
+
+    def _wait_for_rate_limit(self) -> None:
+        last_call = _API_LAST_CALL.get(self.model_name)
+        if last_call is None:
+            return
+        elapsed = time.time() - last_call
+        remaining = self.min_interval_seconds - elapsed
+        if remaining > 0:
+            time.sleep(remaining)
+
+    def _retry_delay_seconds(self, error_body: str) -> Optional[float]:
+        if not error_body:
+            return None
+        match = re.search(r'"retryDelay"\s*:\s*"([0-9]+)s"', error_body)
+        if match:
+            try:
+                return float(match.group(1)) + 1.0
+            except Exception:
+                return None
+        return None
+
+
+class OpenAIAPIAgent(ExtractionCacheMixin, LocalAgent):
+    """Agent that uses the OpenAI Chat Completions API for extraction."""
+    EXTRACTION_PROMPT_VERSION = "openai_extract_v1"
+
+    def __init__(
+        self,
+        agent_id: str,
+        model_name: str,
+        strict_loading: bool = False,
+        extraction_cache_path: Optional[str] = None,
+    ):
+        super().__init__(agent_id, model_name)
+        self.strict_loading = strict_loading
+        self.api_key = _load_env_value("OPENAI_API_KEY") or _load_env_value("OPEN_API_KEY")
+        self.api_base = _load_env_value("OPENAI_API_BASE_URL") or "https://api.openai.com/v1"
+        self.last_extraction_response: str = ""
+        self._init_extraction_cache(extraction_cache_path)
+        if self.strict_loading and not self.api_key:
+            raise RuntimeError("OPENAI_API_KEY (or OPEN_API_KEY) is required for OpenAI API extraction.")
+
+    def _is_transient_network_error(self, exc: Exception) -> bool:
+        if isinstance(exc, urllib.error.URLError):
+            reason = exc.reason
+            if isinstance(reason, socket.gaierror):
+                return True
+            if isinstance(reason, TimeoutError):
+                return True
+            if isinstance(reason, OSError):
+                return True
+        return isinstance(exc, TimeoutError)
+
+    def _retry_sleep_seconds(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        if retry_after is not None and retry_after > 0:
+            return retry_after
+        # Back off more gently for early attempts, then widen to survive
+        # transient DNS / routing issues during long benchmark runs.
+        return min(120.0, 2.0 * (2 ** attempt))
+
+    def generate_response(self, prompt: str, **kwargs) -> str:
+        if not self.api_key:
+            return ""
+
+        url = f"{self.api_base}/chat/completions"
+        payload = {
+            "model": self.model_name,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You extract structured facts from short text. "
+                        "Return only valid JSON."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            },
+            method="POST",
+        )
+
+        last_error: Optional[Exception] = None
+        for attempt in range(8):
+            try:
+                with urllib.request.urlopen(request, timeout=90) as response:
+                    content = response.read().decode("utf-8", errors="replace")
+                payload = json.loads(content)
+                message = payload.get("choices", [{}])[0].get("message", {})
+                text = message.get("content", "")
+                if isinstance(text, list):
+                    text = "".join(str(part.get("text", "")) for part in text if isinstance(part, dict))
+                return str(text).strip()
+            except urllib.error.HTTPError as exc:
+                error_body = ""
+                try:
+                    error_body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    error_body = ""
+                last_error = RuntimeError(f"HTTP {exc.code}: {error_body or exc.reason}")
+                if exc.code not in {429, 500, 502, 503, 504}:
+                    break
+                retry_after: Optional[float] = None
+                match = re.search(r'"retry_after"\s*:\s*([0-9]+)', error_body)
+                if match:
+                    try:
+                        retry_after = float(match.group(1)) + 1.0
+                    except Exception:
+                        retry_after = None
+            except Exception as exc:
+                last_error = exc
+                if not self._is_transient_network_error(exc):
+                    break
+                retry_after = None
+            time.sleep(self._retry_sleep_seconds(attempt, retry_after))
+
+        if self.strict_loading and last_error is not None:
+            raise RuntimeError(f"OpenAI API request failed: {last_error}") from last_error
+        return ""
+
+    def extract_memories(self, text: str) -> List[Dict[str, Any]]:
+        cached = self._load_cached_extraction(text)
+        if cached is not None:
+            return cached
+        prompt = (
+            "Extract structured facts from the input text.\n"
+            "Return ONLY JSON. A JSON object with a top-level key `items` is preferred.\n"
+            "Each item must contain keys: subject, predicate, object_val, confidence, provenance, rationale, support_spans, extractor_id.\n"
+            "Preserve explicit entities and relation names from the input when possible.\n"
+            "Use provenance='llm_inferred'. Confidence must be between 0.5 and 0.95.\n"
+            "If there is exactly one fact, still return JSON with `items` as an array of one object.\n"
+            f"Input: {text}\n"
+            "Output JSON:"
+        )
+        response = self.generate_response(prompt)
+        self.last_extraction_response = response or ""
+        parser = TransformerAgent.__new__(TransformerAgent)
+        parser.model_name = self.model_name
+        items = TransformerAgent._parse_extraction_response(parser, response, text)
+        if items:
+            self._store_cached_extraction(text, items, raw_response=response or "")
+            return items
+        try:
+            payload = json.loads(response or "{}")
+            raw_items = payload.get("items", [])
+            if isinstance(raw_items, dict):
+                raw_items = [raw_items]
+            normalized = []
+            for item in raw_items:
+                norm = TransformerAgent._normalize_extracted_item(parser, item, text)
+                if norm is not None:
+                    normalized.append(norm)
+            if normalized:
+                self._store_cached_extraction(text, normalized, raw_response=response or "")
+            return normalized
+        except Exception:
+            return []
 
 
 def create_agent(agent_id: str, model_type: str = "dummy", reliability: float = None, **kwargs) -> LocalAgent:
@@ -337,12 +819,34 @@ def create_agent(agent_id: str, model_type: str = "dummy", reliability: float = 
         device = kwargs.get("device", "cpu")
         quantization_mode = kwargs.get("quantization_mode")
         strict_loading = kwargs.get("strict_loading", False)
+        extraction_cache_path = kwargs.get("extraction_cache_path")
         return TransformerAgent(
             agent_id,
             model_name=model_name,
             device=device,
             quantization_mode=quantization_mode,
             strict_loading=strict_loading,
+            extraction_cache_path=extraction_cache_path,
+        )
+    elif model_type == "gemini_api":
+        model_name = kwargs.get("model_name", "gemini-2.5-flash-lite")
+        strict_loading = kwargs.get("strict_loading", False)
+        extraction_cache_path = kwargs.get("extraction_cache_path")
+        return GeminiAPIAgent(
+            agent_id,
+            model_name=model_name,
+            strict_loading=strict_loading,
+            extraction_cache_path=extraction_cache_path,
+        )
+    elif model_type == "openai_api":
+        model_name = kwargs.get("model_name", "gpt-4o-mini")
+        strict_loading = kwargs.get("strict_loading", False)
+        extraction_cache_path = kwargs.get("extraction_cache_path")
+        return OpenAIAPIAgent(
+            agent_id,
+            model_name=model_name,
+            strict_loading=strict_loading,
+            extraction_cache_path=extraction_cache_path,
         )
     else:
         raise ValueError(f"Unknown model_type: {model_type}")

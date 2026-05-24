@@ -5,7 +5,13 @@ from typing import Dict, Any, List, Tuple, Optional
 import time
 import json
 import os
+import re
 
+from src.memory.canonicalization import (
+    build_canonical_claim,
+    build_entity_id,
+    canonicalize_memory_triplet,
+)
 from src.memory.shared_memory_store import SharedMemoryStore, MemoryEntry
 from src.conflict.staleness_detector import StalenessDetector
 from src.conflict.conflict_detector import detect_conflict_type
@@ -90,6 +96,67 @@ class ConflictAwareWriter:
             "recall_boost_beta": 0.3,
             "recall_boost_gamma": 0.1,
         })
+
+    @staticmethod
+    def _looks_like_open_text(value: Any) -> bool:
+        text = str(value or "").strip().lower()
+        if not text:
+            return False
+        if len(text.split()) >= 9:
+            return True
+        return any(token in text for token in [";", " and ", " with ", " who ", " that "])
+
+    def _prefer_latest_entity_slot_update(
+        self,
+        proposal: Dict[str, Any],
+        latest: Dict[str, Any],
+        conflict_type: str,
+        new_scores: Dict[str, float],
+        old_scores: Dict[str, float],
+        proposal_timestamp: float,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """
+        Generic overwrite-first policy for terse entity-slot updates.
+
+        This replaces several benchmark-shaped overwrite branches with a broader
+        rule: if the values look like short slot fills rather than descriptive
+        free text, prefer latest information instead of keeping or deferring
+        parallel branches.
+        """
+        predicate = str(proposal.get("predicate", "")).strip().lower()
+        if predicate in {"description", "summary", "bio", "notes"}:
+            return None
+
+        latest_obj = str(latest.get("object_val", "")).strip()
+        proposal_obj = str(proposal.get("object_val", "")).strip()
+        if not latest_obj or not proposal_obj:
+            return None
+        if predicate == "raw_statement":
+            latest_raw = str(latest.get("raw_text", latest_obj)).strip().lower()
+            proposal_raw = str(proposal.get("raw_text", proposal_obj)).strip().lower()
+            if not re.search(r"\b(is|was|are|were|works|worked|plays|founded|created|performed|capital)\b", latest_raw):
+                return None
+            if not re.search(r"\b(is|was|are|were|works|worked|plays|founded|created|performed|capital)\b", proposal_raw):
+                return None
+        if self._looks_like_open_text(latest_obj) or self._looks_like_open_text(proposal_obj):
+            return None
+
+        latest_ts = latest.get("timestamp", 0) if latest else 0
+        if proposal_timestamp >= latest_ts:
+            return "overwrite", {
+                "reason": f"latest_entity_slot_update_{conflict_type}",
+                "new_scores": new_scores,
+                "old_scores": old_scores,
+                "timestamps": {"proposal": proposal_timestamp, "latest": latest_ts},
+                "uncertainty": new_scores.get("uncertainty", 0.0),
+            }
+        return "reject", {
+            "reason": f"older_entity_slot_update_{conflict_type}",
+            "new_scores": new_scores,
+            "old_scores": old_scores,
+            "timestamps": {"proposal": proposal_timestamp, "latest": latest_ts},
+            "uncertainty": new_scores.get("uncertainty", 0.0),
+        }
 
 
     def _load_config(self, config_path: str) -> Dict[str, Any]:
@@ -637,29 +704,18 @@ class ConflictAwareWriter:
         if conflict_type == "semantic_overlap":
             if query_aware_override is not None:
                 return query_aware_override
-
-            if scenario_id and scenario_id.startswith("memoryagentbench_Conflict_Resolution"):
-                prop_ts = proposal_timestamp
-                latest_ts = latest.get("timestamp", 0) if latest else 0
-                if prop_ts >= latest_ts:
-                    action = "overwrite"
-                    return action, {
-                        "reason": "mab_conflict_semantic_overlap_prefers_latest_overwrite",
-                        "similarity": conflict_details.get("similarity", 0.0),
-                        "new_scores": new_scores,
-                        "old_scores": old_scores,
-                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
-                        "uncertainty": new_scores.get("uncertainty", 0.0),
-                    }
-                action = "reject"
-                return action, {
-                    "reason": "mab_conflict_older_semantic_overlap_reject",
-                    "similarity": conflict_details.get("similarity", 0.0),
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
-                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
-                    "uncertainty": new_scores.get("uncertainty", 0.0),
-                }
+            latest_entity_slot = self._prefer_latest_entity_slot_update(
+                proposal,
+                latest,
+                conflict_type,
+                new_scores,
+                old_scores,
+                proposal_timestamp,
+            )
+            if latest_entity_slot is not None:
+                action, details = latest_entity_slot
+                details["similarity"] = conflict_details.get("similarity", 0.0)
+                return action, details
 
             # For semantic overlap, the appropriate action is to merge the values
             # The detector already determined there is significant overlap
@@ -675,26 +731,16 @@ class ConflictAwareWriter:
 
         # Compatible extension - keep both versions
         if conflict_type == "compatible_extension":
-            if scenario_id and scenario_id.startswith("memoryagentbench_Conflict_Resolution"):
-                prop_ts = proposal_timestamp
-                latest_ts = latest.get("timestamp", 0) if latest else 0
-                if prop_ts >= latest_ts:
-                    action = "overwrite"
-                    return action, {
-                        "reason": "mab_conflict_compatible_extension_prefers_latest_overwrite",
-                        "new_scores": new_scores,
-                        "old_scores": old_scores,
-                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
-                        "uncertainty": new_scores.get("uncertainty", 0.0),
-                    }
-                action = "reject"
-                return action, {
-                    "reason": "mab_conflict_older_compatible_extension_reject",
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
-                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
-                    "uncertainty": new_scores.get("uncertainty", 0.0),
-                }
+            latest_entity_slot = self._prefer_latest_entity_slot_update(
+                proposal,
+                latest,
+                conflict_type,
+                new_scores,
+                old_scores,
+                proposal_timestamp,
+            )
+            if latest_entity_slot is not None:
+                return latest_entity_slot
             action = "keep_multiple_versions"
             return action, {
                 "reason": "compatible_information",
@@ -717,27 +763,18 @@ class ConflictAwareWriter:
             latest_ts = latest.get("timestamp", 0)
             overwrite_thresh = self.arbitration_thresholds.get("overwrite_margin", 0.15)
             keep_margin = self.arbitration_thresholds.get("keep_multiple_versions_margin", 0.08)
-
-            if scenario_id and scenario_id.startswith("memoryagentbench_Conflict_Resolution"):
-                if prop_ts >= latest_ts:
-                    action = "overwrite"
-                    return action, {
-                        "reason": "mab_conflict_potential_contradiction_prefers_latest_overwrite",
-                        "new_scores": new_scores,
-                        "old_scores": old_scores,
-                        "timestamps": {"proposal": prop_ts, "latest": latest_ts},
-                        "margin": margin,
-                        "uncertainty": new_uncertainty,
-                    }
-                action = "reject"
-                return action, {
-                    "reason": "mab_conflict_older_potential_contradiction_reject",
-                    "new_scores": new_scores,
-                    "old_scores": old_scores,
-                    "timestamps": {"proposal": prop_ts, "latest": latest_ts},
-                    "margin": margin,
-                    "uncertainty": new_uncertainty,
-                }
+            latest_entity_slot = self._prefer_latest_entity_slot_update(
+                proposal,
+                latest,
+                conflict_type,
+                new_scores,
+                old_scores,
+                proposal_timestamp,
+            )
+            if latest_entity_slot is not None:
+                action, details = latest_entity_slot
+                details["margin"] = margin
+                return action, details
 
             if avg_uncertainty > 0.6:
                 action = "defer"
@@ -760,7 +797,7 @@ class ConflictAwareWriter:
                         "margin": margin,
                         "uncertainty": new_uncertainty,
                     }
-                elif abs(margin) < keep_margin:
+                elif abs(margin) <= keep_margin + 1e-9:
                     # Very close - if proposal is newer, overwrite; else keep both
                     if prop_ts > latest_ts:
                         action = "overwrite"
@@ -953,8 +990,30 @@ class ConflictAwareWriter:
                     # Fall back to text concatenation with separator
                     entry.object_val = f"{latest_obj} | {new_obj}"
 
-            # Update canonical claim
-            entry.canonical_claim = f"{entry.subject} {entry.predicate} {entry.object_val}"
+            canonical_subject, canonical_predicate, canonical_object = canonicalize_memory_triplet(
+                entry.subject,
+                entry.predicate,
+                entry.object_val,
+                raw_text=entry.raw_text,
+            )
+            entry.subject = canonical_subject
+            entry.predicate = canonical_predicate
+            entry.object_val = canonical_object
+            entry.canonical_subject = canonical_subject
+            entry.canonical_predicate = canonical_predicate
+            entry.canonical_object_val = canonical_object
+            entry.entity_id = build_entity_id(
+                entry.subject,
+                entry.predicate,
+                raw_text=entry.raw_text,
+                object_val=entry.object_val,
+            )
+            entry.canonical_claim = build_canonical_claim(
+                entry.subject,
+                entry.predicate,
+                entry.object_val,
+                raw_text=entry.raw_text,
+            )
 
             # Add merge metadata
             if entry.arbitration_metadata is None:

@@ -14,6 +14,7 @@ from src.conflict.query_aware_context import (
     summarize_query_plan,
 )
 from src.evaluation.qa_reasoner import answer_question_from_memories, score_answers
+from src.evaluation.state_alignment import canonicalize_state_facts
 from src.memory.proposal_contract import normalize_proposal
 
 
@@ -81,13 +82,14 @@ class MultiAgentPipeline:
             cfg = self._resolve_agent_config(aid, idx)
             runtime = AgentRuntime(self.store, aid, mode=cfg.get("runtime_mode", "debug_fallback"))
             extractor = None
-            if cfg.get("model_type") == "transformer":
+            if cfg.get("model_type") in {"transformer", "gemini_api", "openai_api"}:
                 from src.local_models.runner import create_agent
                 extractor = create_agent(
                     agent_id=aid,
-                    model_type="transformer",
-                    model_name=cfg.get("model_name", "Qwen/Qwen2.5-1.5B-Instruct"),
+                    model_type=cfg.get("model_type"),
+                    model_name=cfg.get("model_name", "gemini-2.5-flash-lite"),
                     device=cfg.get("device", "cpu"),
+                    quantization_mode=cfg.get("quantization_mode"),
                     strict_loading=self.strict_agent_execution,
                 )
             agents[aid] = {
@@ -385,21 +387,19 @@ class MultiAgentPipeline:
         """Compute metrics for this scenario."""
         gold_visible = scenario.get("gold_visible_shared_state_after_commit", [])
         final_visible = logs["final_visible_state"]
-
-        # Normalize states for comparison
-        def norm(records):
-            out = []
-            for r in records:
-                subj = r.get("subject", "")
-                pred = r.get("predicate", "")
-                obj = str(r.get("object_val", r.get("object", "")))
-                out.append((subj, pred, obj))
-            return sorted(out)
-
-        state_match = norm(final_visible) == norm(gold_visible)
+        raw_state_match = sorted(
+            (r.get("subject", ""), r.get("predicate", ""), str(r.get("object_val", r.get("object", ""))))
+            for r in final_visible
+        ) == sorted(
+            (r.get("subject", ""), r.get("predicate", ""), str(r.get("object_val", r.get("object", ""))))
+            for r in gold_visible
+        )
+        state_match = canonicalize_state_facts(final_visible) == canonicalize_state_facts(gold_visible)
 
         metrics = {
             "state_match": state_match,
+            "raw_state_match": raw_state_match,
+            "canonical_state_match": state_match,
             "num_writes": len(logs["write_proposals"]),
             "num_conflicts": len(logs["detected_conflicts"]),
             "scenario_contract_version": scenario.get("_scenario_contract_version"),

@@ -13,6 +13,7 @@ from src.benchmarks.scenario_contract import scenario_identifier, scenarios_to_d
 from src.pipeline.multi_agent_pipeline import MultiAgentPipeline
 from src.evaluation.error_analysis import build_error_analysis_report
 from src.evaluation.qa_reasoner import analyze_question_requirements
+from src.evaluation.state_alignment import canonicalize_state_facts, raw_state_facts
 
 try:
     from tqdm import tqdm
@@ -23,7 +24,14 @@ except ImportError:
 
 def _use_tqdm() -> bool:
     disable_flag = os.environ.get("PROJECTMEM_DISABLE_TQDM", "").strip().lower()
-    return HAVE_TQDM and disable_flag not in {"1", "true", "yes", "on"}
+    if not HAVE_TQDM or disable_flag in {"1", "true", "yes", "on"}:
+        return False
+
+    # tqdm progress bars are only useful on interactive terminals.
+    # In Windows/background runs with redirected stdio, tqdm can hit invalid
+    # handle/console states during long benchmark jobs and break report finalization.
+    stderr = getattr(sys, "stderr", None)
+    return bool(stderr) and hasattr(stderr, "isatty") and stderr.isatty()
 
 
 def _write_json(path: str, payload: Dict[str, Any]) -> None:
@@ -115,6 +123,54 @@ def _write_partial_report(
             "mode_order": [spec["result_key"] for spec in mode_specs],
         },
     )
+
+
+def _canonical_state_match(result: Dict[str, Any], scenario_dict: Dict[str, Any]) -> bool:
+    gold_facts = canonicalize_state_facts(scenario_dict.get("gold_visible_shared_state_after_commit", []))
+    pred_facts = canonicalize_state_facts(result.get("final_visible_state", []))
+    return pred_facts == gold_facts
+
+
+def _raw_state_match(result: Dict[str, Any], scenario_dict: Dict[str, Any]) -> bool:
+    gold_facts = raw_state_facts(scenario_dict.get("gold_visible_shared_state_after_commit", []))
+    pred_facts = raw_state_facts(result.get("final_visible_state", []))
+    return pred_facts == gold_facts
+
+
+def _compute_state_alignment_summary(
+    mode_results: Sequence[Dict[str, Any]],
+    scenario_dicts: Sequence[Dict[str, Any]],
+    *,
+    canonicalize: bool,
+) -> Dict[str, float]:
+    fact_builder = canonicalize_state_facts if canonicalize else raw_state_facts
+    match_total = 0
+    total_gold = 0
+    total_pred = 0
+    total_correct = 0
+
+    for result, scenario_dict in zip(mode_results, scenario_dicts):
+        gold_facts = fact_builder(scenario_dict.get("gold_visible_shared_state_after_commit", []))
+        pred_facts = fact_builder(result.get("final_visible_state", []))
+        if pred_facts == gold_facts:
+            match_total += 1
+        total_gold += len(gold_facts)
+        total_pred += len(pred_facts)
+        total_correct += len(gold_facts & pred_facts)
+
+    precision = total_correct / total_pred if total_pred else 0.0
+    recall = total_correct / total_gold if total_gold else 0.0
+    memory_f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) else 0.0
+    )
+    return {
+        "state_match": match_total / len(mode_results) if mode_results else 0.0,
+        "state_match_count": match_total,
+        "memory_precision": precision,
+        "memory_recall": recall,
+        "memory_f1": memory_f1,
+    }
 
 
 def run_evaluation_with_scenarios(
@@ -284,6 +340,9 @@ def _build_failure_bundle(
 
     error_report = build_error_analysis_report(raw_results, scenarios)
     for mode, mode_results in raw_results.items():
+        summary_counts = error_report.get(mode, {}).get("summary_counts", {})
+        qa_outcome = _compute_qa_outcome_matrix(mode_results, scenario_dicts)
+        qa_failure_channels = _compute_qa_failure_channels(summary_counts)
         per_scenario: List[Dict[str, Any]] = []
         for idx, (scenario_dict, result) in enumerate(zip(scenario_dicts, mode_results), start=1):
             qa_results = result.get("qa_results") or []
@@ -293,7 +352,9 @@ def _build_failure_bundle(
                     "scenario_index": idx,
                     "scenario_id": scenario_dict.get("scenario_id"),
                     "scenario_type": scenario_dict.get("scenario_type"),
-                    "state_match": bool((result.get("metrics") or {}).get("state_match", False)),
+                    "state_match": _canonical_state_match(result, scenario_dict),
+                    "raw_state_match": _raw_state_match(result, scenario_dict),
+                    "canonical_state_match": _canonical_state_match(result, scenario_dict),
                     "qa_total": len(qa_results),
                     "qa_failures": len(qa_failures),
                     "qa_successes": len(qa_results) - len(qa_failures),
@@ -311,11 +372,104 @@ def _build_failure_bundle(
                 }
             )
         bundle["modes"][mode] = {
-            "summary_counts": error_report.get(mode, {}).get("summary_counts", {}),
+            "summary_counts": summary_counts,
             "per_scenario": per_scenario,
+            "research_facing_summary": _build_research_facing_summary(
+                len(scenario_dicts),
+                qa_outcome,
+                qa_failure_channels,
+            ),
             "detailed_failures": error_report.get(mode, {}).get("detailed_failures", []),
         }
     return bundle
+
+
+def _safe_rate(count: int, total: int) -> float:
+    return count / total if total else 0.0
+
+
+def _compute_qa_outcome_matrix(
+    results_list: Sequence[Dict[str, Any]],
+    scenario_dicts: Sequence[Dict[str, Any]],
+) -> Dict[str, int]:
+    qa_outcome = {
+        "arbitration_correct_qa_correct": 0,
+        "arbitration_correct_qa_wrong": 0,
+        "arbitration_wrong_qa_correct": 0,
+        "arbitration_wrong_qa_wrong": 0,
+        "no_qa": 0,
+    }
+    for scenario_dict, result in zip(scenario_dicts, results_list):
+        qa_results = result.get("qa_results") or []
+        state_match = _canonical_state_match(result, scenario_dict)
+        if not qa_results:
+            qa_outcome["no_qa"] += 1
+            continue
+        qa_success = all(bool(item.get("exact_match", False)) for item in qa_results)
+        if state_match and qa_success:
+            qa_outcome["arbitration_correct_qa_correct"] += 1
+        elif state_match and not qa_success:
+            qa_outcome["arbitration_correct_qa_wrong"] += 1
+        elif (not state_match) and qa_success:
+            qa_outcome["arbitration_wrong_qa_correct"] += 1
+        else:
+            qa_outcome["arbitration_wrong_qa_wrong"] += 1
+    return qa_outcome
+
+
+def _compute_qa_failure_channels(summary_counts: Dict[str, int]) -> Dict[str, int]:
+    return {
+        "anchor_resolution_failure": summary_counts.get("wrong_anchor_resolution", 0),
+        "reverse_relation_failure": summary_counts.get("wrong_reverse_relation", 0),
+        "graph_edge_failure": (
+            summary_counts.get("parser_no_edge", 0)
+            + summary_counts.get("missing_terminal_edge", 0)
+        ),
+        "answer_type_mismatch": summary_counts.get("answer_type_mismatch", 0),
+        "answer_selection_failure": summary_counts.get("overwrite_correct_but_qa_unused", 0),
+        "stale_query_state_mismatch": summary_counts.get("stale_query_state_mismatch", 0),
+    }
+
+
+def _build_research_facing_summary(
+    total_scenarios: int,
+    qa_outcome: Dict[str, int],
+    qa_failure_channels: Dict[str, int],
+) -> Dict[str, Any]:
+    final_memory_vs_qa_counts = {
+        "final_memory_match_and_qa_success": qa_outcome["arbitration_correct_qa_correct"],
+        "final_memory_match_but_qa_failure": qa_outcome["arbitration_correct_qa_wrong"],
+        "final_memory_mismatch_but_qa_success": qa_outcome["arbitration_wrong_qa_correct"],
+        "final_memory_mismatch_and_qa_failure": qa_outcome["arbitration_wrong_qa_wrong"],
+        "no_qa": qa_outcome["no_qa"],
+    }
+    total_failed_questions = sum(qa_failure_channels.values())
+    primary_qa_failure = "none"
+    if total_failed_questions:
+        primary_qa_failure = sorted(
+            qa_failure_channels.items(),
+            key=lambda item: (-item[1], item[0]),
+        )[0][0]
+
+    return {
+        "final_memory_vs_qa": {
+            "counts": final_memory_vs_qa_counts,
+            "rates": {
+                key: _safe_rate(value, total_scenarios)
+                for key, value in final_memory_vs_qa_counts.items()
+            },
+            "note": "final_memory_match uses canonical final_visible_state vs gold_visible_shared_state_after_commit.",
+        },
+        "qa_failure_breakdown": {
+            "total_failed_questions": total_failed_questions,
+            "counts": qa_failure_channels,
+            "rates_over_failed_questions": {
+                key: _safe_rate(value, total_failed_questions)
+                for key, value in qa_failure_channels.items()
+            },
+            "primary_qa_failure": primary_qa_failure,
+        },
+    }
 
 
 def _build_error_channel_report(
@@ -326,42 +480,17 @@ def _build_error_channel_report(
     scenario_dicts = scenarios_to_dicts(scenarios)
     report: Dict[str, Any] = {"modes": {}}
     for mode, results_list in raw_results.items():
-        qa_outcome = {
-            "arbitration_correct_qa_correct": 0,
-            "arbitration_correct_qa_wrong": 0,
-            "arbitration_wrong_qa_correct": 0,
-            "arbitration_wrong_qa_wrong": 0,
-            "no_qa": 0,
-        }
-        for scenario_dict, result in zip(scenario_dicts, results_list):
-            qa_results = result.get("qa_results") or []
-            state_match = bool((result.get("metrics") or {}).get("state_match", False))
-            if not qa_results:
-                qa_outcome["no_qa"] += 1
-                continue
-            qa_success = all(bool(item.get("exact_match", False)) for item in qa_results)
-            if state_match and qa_success:
-                qa_outcome["arbitration_correct_qa_correct"] += 1
-            elif state_match and not qa_success:
-                qa_outcome["arbitration_correct_qa_wrong"] += 1
-            elif (not state_match) and qa_success:
-                qa_outcome["arbitration_wrong_qa_correct"] += 1
-            else:
-                qa_outcome["arbitration_wrong_qa_wrong"] += 1
-
+        qa_outcome = _compute_qa_outcome_matrix(results_list, scenario_dicts)
         summary_counts = error_report.get(mode, {}).get("summary_counts", {})
+        qa_failure_channels = _compute_qa_failure_channels(summary_counts)
         report["modes"][mode] = {
             "qa_outcome_matrix": qa_outcome,
-            "qa_failure_channels": {
-                "anchor_resolution_failure": summary_counts.get("wrong_anchor_resolution", 0),
-                "reverse_relation_failure": summary_counts.get("wrong_reverse_relation", 0),
-                "graph_edge_failure": (
-                    summary_counts.get("parser_no_edge", 0)
-                    + summary_counts.get("missing_terminal_edge", 0)
-                ),
-                "answer_type_mismatch": summary_counts.get("answer_type_mismatch", 0),
-                "answer_selection_failure": summary_counts.get("overwrite_correct_but_qa_unused", 0),
-            },
+            "qa_failure_channels": qa_failure_channels,
+            "research_facing_summary": _build_research_facing_summary(
+                len(scenario_dicts),
+                qa_outcome,
+                qa_failure_channels,
+            ),
         }
     return report
 
@@ -404,6 +533,12 @@ def _build_report_payload(
             "adapter_input": "ISF scenario dictionaries",
             "runtime_memory_model": "canonical MemoryEntry lifecycle",
             "qa_surface": "final_visible_state",
+        },
+        "state_alignment_reporting": {
+            "scenario_accuracy_alias": "canonical_state_match",
+            "final_memory_f1_alias": "canonical_memory_f1",
+            "raw_state_match_definition": "fraction of scenarios whose final_visible_state exactly matches gold without canonicalization",
+            "canonical_state_match_definition": "fraction of scenarios whose final_visible_state matches gold after repo canonicalization",
         },
         "results": results,
         "deltas": deltas,
@@ -711,7 +846,9 @@ def _compute_mode_metrics(
         return result.get("conflict_type", "none") != "none"
 
     total_scenarios = len(mode_results)
-    scenario_correct = sum(1 for r in mode_results if r["metrics"]["state_match"])
+    raw_alignment = _compute_state_alignment_summary(mode_results, scenario_dicts, canonicalize=False)
+    canonical_alignment = _compute_state_alignment_summary(mode_results, scenario_dicts, canonicalize=True)
+    scenario_correct = canonical_alignment["state_match_count"]
     total_writes = sum(r["metrics"]["num_writes"] for r in mode_results)
     total_conflicts = sum(r["metrics"]["num_conflicts"] for r in mode_results)
     any_gold_conflicts = any(s.get("gold_conflict_exists", False) for s in scenario_dicts)
@@ -800,7 +937,7 @@ def _compute_mode_metrics(
             scenario_diagnostics["no_qa"] += 1
         else:
             qa_success = all(bool(item.get("exact_match", False)) for item in qa_results)
-            state_match = bool(res["metrics"]["state_match"])
+            state_match = _canonical_state_match(res, scen_dict)
             if state_match and qa_success:
                 scenario_diagnostics["state_match_and_qa_success"] += 1
             elif state_match and not qa_success:
@@ -1007,34 +1144,6 @@ def _compute_mode_metrics(
                      if dec.get("resolution_action") == "defer")
     judge_free_rate = 1.0 - (defer_count / total_writes) if total_writes else 1.0
 
-    # Final memory F1: compare final_visible_state vs gold_visible_shared_state_after_commit
-    def extract_facts(state):
-        facts = set()
-        for r in state:
-            subj = r.get("subject", "")
-            pred = r.get("predicate", "")
-            obj = str(r.get("object_val", r.get("object", "")))
-            facts.add((subj, pred, obj))
-        return facts
-
-    total_gold = 0
-    total_pred = 0
-    total_correct = 0
-    for res, scen_dict in zip(mode_results, scenario_dicts):
-        gold_state = scen_dict.get("gold_visible_shared_state_after_commit", [])
-        pred_state = res.get("final_visible_state", [])
-        gold_facts = extract_facts(gold_state)
-        pred_facts = extract_facts(pred_state)
-        total_gold += len(gold_facts)
-        total_pred += len(pred_facts)
-        total_correct += len(gold_facts & pred_facts)
-    memory_precision = total_correct / total_pred if total_pred else 0.0
-    memory_recall = total_correct / total_gold if total_gold else 0.0
-    memory_f1 = (
-        2 * memory_precision * memory_recall / (memory_precision + memory_recall)
-        if (memory_precision + memory_recall) else 0.0
-    )
-
     # Per-conflict-type action accuracy (conflict decisions only)
     per_type_correct = {}
     per_type_total = {}
@@ -1063,6 +1172,10 @@ def _compute_mode_metrics(
 
     return {
         "scenario_accuracy": scenario_correct / total_scenarios if total_scenarios else 0.0,
+        "raw_state_match": raw_alignment["state_match"],
+        "raw_state_match_count": raw_alignment["state_match_count"],
+        "canonical_state_match": canonical_alignment["state_match"],
+        "canonical_state_match_count": canonical_alignment["state_match_count"],
         "conflict_detection_accuracy": conflict_detection_accuracy,
         "conflict_type_accuracy": conflict_type_accuracy,
         "conflict_precision": conflict_precision,
@@ -1108,7 +1221,15 @@ def _compute_mode_metrics(
         "temporal_update_accuracy": temporal_update_accuracy,
         "counterfactual_accuracy": counterfactual_accuracy,
         "judge_free_rate": judge_free_rate,
-        "final_memory_f1": memory_f1,
+        "raw_memory_precision": raw_alignment["memory_precision"],
+        "raw_memory_recall": raw_alignment["memory_recall"],
+        "raw_memory_f1": raw_alignment["memory_f1"],
+        "canonical_memory_precision": canonical_alignment["memory_precision"],
+        "canonical_memory_recall": canonical_alignment["memory_recall"],
+        "canonical_memory_f1": canonical_alignment["memory_f1"],
+        "final_memory_f1": canonical_alignment["memory_f1"],
+        "final_memory_f1_definition": "alias of canonical_memory_f1",
+        "scenario_accuracy_definition": "alias of canonical_state_match",
         "avg_branch_count": avg_branch_count,
         "conflict_type_distribution": conflict_type_distribution,
         "requires_judge_count": requires_judge_count,

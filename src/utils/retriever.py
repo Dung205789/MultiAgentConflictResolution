@@ -13,6 +13,7 @@ except Exception:
     SentenceTransformer = None
 
 from src.memory.lifecycle import score_for_recall as lifecycle_score
+from src.memory.canonicalization import build_entity_id
 
 try:
     from src.memory.shared_memory_store import MemoryEntry
@@ -349,7 +350,12 @@ def retrieve_topk(
         # Group by entity_id
         entity_groups = {}
         for mem, score in results:
-            entity_id = f"{mem.get('subject')}_{mem.get('predicate')}"
+            entity_id = mem.get("entity_id") or build_entity_id(
+                mem.get("subject"),
+                mem.get("predicate"),
+                raw_text=mem.get("raw_text", ""),
+                object_val=mem.get("object_val", ""),
+            )
             if entity_id not in entity_groups:
                 entity_groups[entity_id] = []
             entity_groups[entity_id].append((mem, score))

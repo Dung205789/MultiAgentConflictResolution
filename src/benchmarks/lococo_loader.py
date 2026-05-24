@@ -1,19 +1,29 @@
 """
-LoCoMo adapter for Hugging Face dataset.
+LoCoMo adapter for the official dataset release.
 
-Dataset: https://huggingface.co/datasets/Aman279/Locomo
-Paper/Repo: https://github.com/snap-research/LoCoMo
+Primary source:
+- Repo: https://github.com/snap-research/locomo
+- Dataset file: data/locomo10.json
 
-LoCoMo (Long Context Memory) evaluates the ability to retrieve and reason
-over long conversations with multiple participants and complex dependencies.
+The repository previously assumed a Hugging Face schema that does not match the
+official release. This loader now prefers the official `locomo10.json` layout
+when present locally and falls back to the older streaming path only if needed.
 """
 import json
-from typing import Dict, List, Any, Optional
+from pathlib import Path
+from typing import Dict, List, Any, Optional, Iterable
 
 from src.benchmarks.generator_core import generate_scenario
 
 
-def load_lococo(subset: str = "all", num_samples: int = None) -> List[Dict[str, Any]]:
+DEFAULT_LOCAL_PATH = Path("data/raw/locomo/locomo10.json")
+
+
+def load_lococo(
+    subset: str = "all",
+    num_samples: int = None,
+    dataset_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
     Load LoCoMo from Hugging Face.
 
@@ -24,6 +34,30 @@ def load_lococo(subset: str = "all", num_samples: int = None) -> List[Dict[str, 
     Returns:
         List of scenarios in the repository's benchmark format.
     """
+    local_path = Path(dataset_path) if dataset_path else DEFAULT_LOCAL_PATH
+    if local_path.exists():
+        scenarios = _load_from_official_json(local_path, num_samples=num_samples)
+        print(f"Loaded {len(scenarios)} LoCoMo scenarios from {local_path}")
+        return scenarios
+
+    scenarios = _load_from_legacy_hf(subset=subset, num_samples=num_samples)
+    print(f"Loaded {len(scenarios)} LoCoMo scenarios")
+    return scenarios
+
+
+def _load_from_official_json(dataset_path: Path, num_samples: Optional[int]) -> List[Dict[str, Any]]:
+    data = json.loads(dataset_path.read_text(encoding="utf-8"))
+    scenarios = []
+    for idx, item in enumerate(data):
+        scenario = _convert_official_locomo_item(item, idx)
+        if scenario:
+            scenarios.append(scenario)
+        if num_samples is not None and len(scenarios) >= num_samples:
+            break
+    return scenarios
+
+
+def _load_from_legacy_hf(subset: str, num_samples: Optional[int]) -> List[Dict[str, Any]]:
     try:
         from datasets import load_dataset
     except ImportError:
@@ -35,19 +69,7 @@ def load_lococo(subset: str = "all", num_samples: int = None) -> List[Dict[str, 
 
     try:
         if subset == "all":
-            # Load all available splits and combine
-            ds_splits = []
-            for split in ["train", "test", "validation"]:
-                try:
-                    ds = load_dataset(dataset_name, split=split, streaming=True)
-                    ds_splits.append(ds)
-                except:
-                    continue
-            if not ds_splits:
-                print("No splits could be loaded")
-                return []
-            # We'll iterate through all streams
-            ds = ds_splits
+            ds = [load_dataset(dataset_name, split="train", streaming=True)]
         else:
             ds = [load_dataset(dataset_name, split=subset, streaming=True)]
     except Exception as e:
@@ -66,8 +88,139 @@ def load_lococo(subset: str = "all", num_samples: int = None) -> List[Dict[str, 
         if num_samples is not None and len(scenarios) >= num_samples:
             break
 
-    print(f"Loaded {len(scenarios)} LoCoMo scenarios")
     return scenarios
+
+
+def _convert_official_locomo_item(item: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
+    sample_id = item.get("sample_id", f"locomo_{idx}")
+    conversation = item.get("conversation", {})
+    qa_items = item.get("qa", [])
+    event_summary = item.get("event_summary", {})
+
+    if not conversation:
+        return None
+
+    speaker_a = conversation.get("speaker_a", "speaker_a")
+    speaker_b = conversation.get("speaker_b", "speaker_b")
+    session_keys = sorted(
+        [
+            key for key in conversation.keys()
+            if key.startswith("session_") and not key.endswith("_date_time")
+        ],
+        key=_session_sort_key,
+    )
+    if not session_keys:
+        return None
+
+    evidence_ids = {
+        str(evidence_id)
+        for qa in qa_items
+        for evidence_id in qa.get("evidence", [])
+        if evidence_id
+    }
+
+    ordered_events: List[Dict[str, Any]] = []
+    step = 1
+    base_timestamp = 1000.0
+    time_step = 60.0
+
+    for session_key in session_keys:
+        session_date = conversation.get(f"{session_key}_date_time", "")
+        ordered_events.append({
+            "step": step,
+            "agent_id": "system_agent",
+            "event_type": "write_proposal",
+            "timestamp": base_timestamp + (step - 1) * time_step,
+            "proposal": {
+                "subject": session_key,
+                "predicate": "session_date",
+                "object_val": session_date,
+                "confidence": 1.0,
+                "provenance": "locomo_session_metadata",
+                "session_id": session_key,
+            },
+        })
+        step += 1
+
+        for turn in conversation.get(session_key, []):
+            dia_id = str(turn.get("dia_id", f"{session_key}:{step}"))
+            ordered_events.append({
+                "step": step,
+                "agent_id": "agent_a" if turn.get("speaker") == speaker_a else "agent_b",
+                "event_type": "write_proposal",
+                "timestamp": base_timestamp + (step - 1) * time_step,
+                "proposal": {
+                    "subject": turn.get("speaker", "unknown"),
+                    "predicate": "utterance",
+                    "object_val": turn.get("text", ""),
+                    "confidence": 0.9,
+                    "provenance": "locomo_conversation",
+                    "raw_text": turn.get("text", ""),
+                    "dia_id": dia_id,
+                    "session_id": session_key,
+                    "session_date": session_date,
+                    "supports_answer": dia_id in evidence_ids,
+                },
+            })
+            step += 1
+
+    queries = []
+    for qa in qa_items:
+        question = qa.get("question", "")
+        answer = qa.get("answer", "")
+        if not question:
+            continue
+        gold_answers = answer if isinstance(answer, list) else [answer]
+        queries.append({
+            "query_text": question,
+            "gold_answers": gold_answers,
+            "expected_retrieval_style": "best",
+        })
+
+    gold_memory_state = []
+    for session_key in session_keys:
+        session_date = conversation.get(f"{session_key}_date_time", "")
+        gold_memory_state.append({
+            "subject": session_key,
+            "predicate": "session_date",
+            "object_val": session_date,
+            "status": "active",
+            "confidence": 1.0,
+            "provenance": "locomo_session_metadata",
+        })
+        session_events = event_summary.get(f"events_{session_key}", {})
+        if isinstance(session_events, dict):
+            for speaker, summaries in session_events.items():
+                if speaker == "date":
+                    continue
+                for summary in _ensure_list(summaries):
+                    gold_memory_state.append({
+                        "subject": speaker,
+                        "predicate": "session_event",
+                        "object_val": summary,
+                        "status": "active",
+                        "confidence": 1.0,
+                        "provenance": "locomo_event_summary",
+                    })
+
+    scenario_type = "locomo_long_conversation"
+    if len(session_keys) >= 15:
+        scenario_type = "locomo_very_long_term_memory"
+
+    return generate_scenario(
+        scenario_id=sample_id,
+        scenario_type=scenario_type,
+        agents=["agent_a", "agent_b"],
+        ordered_events=ordered_events,
+        gold_conflict_exists=False,
+        gold_conflict_type="none",
+        gold_resolution_action="append",
+        gold_reconciled_memory_state=gold_memory_state,
+        gold_visible_shared_state_after_commit=gold_memory_state,
+        description=f"LoCoMo conversation: {len(session_keys)} sessions, {len(qa_items)} QA items",
+        queries=queries,
+        base_timestamp=base_timestamp,
+    )
 
 
 def _convert_lococo_item(item: Dict[str, Any], idx: int) -> Optional[Dict[str, Any]]:
@@ -185,6 +338,21 @@ def _convert_lococo_item(item: Dict[str, Any], idx: int) -> Optional[Dict[str, A
     )
 
     return scenario
+
+
+def _session_sort_key(key: str) -> int:
+    try:
+        return int(key.split("_")[1])
+    except Exception:
+        return 0
+
+
+def _ensure_list(value: Any) -> Iterable[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
 
 
 def _extract_facts_from_text(text: str, speaker: str) -> List[Dict[str, Any]]:

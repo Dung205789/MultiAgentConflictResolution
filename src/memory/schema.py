@@ -5,6 +5,12 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+from src.memory.canonicalization import (
+    build_canonical_claim,
+    build_entity_id,
+    canonicalize_memory_triplet,
+)
+
 
 MEMORY_LIFECYCLE_STAGES = {
     "proposal",
@@ -85,10 +91,29 @@ class MemoryEntry:
 
     memory_id: str = field(default_factory=_new_memory_id)
     entity_id: Optional[str] = None
+    canonical_subject: Optional[str] = None
+    canonical_predicate: Optional[str] = None
+    canonical_object_val: Optional[Any] = None
 
     def __post_init__(self) -> None:
-        if not self.entity_id:
-            self.entity_id = f"{self.subject}_{self.predicate}"
+        canonical_subject, canonical_predicate, canonical_object_val = canonicalize_memory_triplet(
+            self.subject,
+            self.predicate,
+            self.object_val,
+            raw_text=self.raw_text,
+        )
+        self.subject = canonical_subject
+        self.predicate = canonical_predicate
+        self.object_val = canonical_object_val
+        self.canonical_subject = canonical_subject
+        self.canonical_predicate = canonical_predicate
+        self.canonical_object_val = canonical_object_val
+        self.entity_id = build_entity_id(
+            self.subject,
+            self.predicate,
+            raw_text=self.raw_text,
+            object_val=self.object_val,
+        )
 
         if self.timestamp is None:
             self.timestamp = _now()
@@ -104,8 +129,12 @@ class MemoryEntry:
         if self.provenance is None:
             self.provenance = "inferred"
 
-        if not self.canonical_claim:
-            self.canonical_claim = f"{self.subject} {self.predicate} {self.object_val}"
+        self.canonical_claim = build_canonical_claim(
+            self.subject,
+            self.predicate,
+            self.object_val,
+            raw_text=self.raw_text,
+        )
         if self.canonical_status is None:
             self.canonical_status = self.status
 

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 import json
 import time
 
+from src.memory.canonicalization import build_entity_id, canonicalize_predicate_name, canonicalize_subject
 from src.memory.schema import MemoryEntry
 
 
@@ -23,7 +24,7 @@ class SharedMemoryStore:
         self._load()
 
     def _index_record(self, entry: MemoryEntry) -> None:
-        self._records_by_entity.setdefault(entry.entity_id or f"{entry.subject}_{entry.predicate}", []).append(entry)
+        self._records_by_entity.setdefault(entry.entity_id or build_entity_id(entry.subject, entry.predicate), []).append(entry)
 
     def reset(self) -> None:
         self.records = []
@@ -136,10 +137,11 @@ class SharedMemoryStore:
         return record
 
     def get_visible_by_predicate(self, predicate: str, agent_id: Optional[str] = None) -> List[MemoryEntry]:
+        canonical_predicate = canonicalize_predicate_name(predicate)
         return [
             record
             for record in self.records
-            if record.predicate == predicate
+            if record.predicate == canonical_predicate
             and record.status == "active"
             and record.visibility_state == "visible"
             and (agent_id is None or record.agent_id == agent_id)
@@ -160,7 +162,7 @@ class SharedMemoryStore:
         return list(self._records_by_entity.get(entity_id, []))
 
     def get_visible_candidates(self, subject: str, predicate: str, at_time: Optional[float] = None) -> List[MemoryEntry]:
-        entity_id = f"{subject}_{predicate}"
+        entity_id = build_entity_id(subject, predicate)
         candidates = [
             record
             for record in self._records_by_entity.get(entity_id, [])
@@ -195,10 +197,12 @@ class SharedMemoryStore:
     ) -> List[MemoryEntry]:
         records = self.records if include_non_visible else self.visible_state(at_time=at_time)
         out: List[MemoryEntry] = []
+        canonical_subject = canonicalize_subject(subject) if subject is not None else None
+        canonical_predicate = canonicalize_predicate_name(predicate) if predicate is not None else None
         for record in records:
-            if subject is not None and record.subject != subject:
+            if canonical_subject is not None and record.subject != canonical_subject:
                 continue
-            if predicate is not None and record.predicate != predicate:
+            if canonical_predicate is not None and record.predicate != canonical_predicate:
                 continue
             if include_non_visible or record.is_visible_at(at_time):
                 out.append(record)

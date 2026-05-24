@@ -34,6 +34,7 @@ import argparse
 import json
 import sys
 import os
+import re
 from datetime import datetime, UTC
 from typing import Dict, Any, List
 
@@ -79,6 +80,35 @@ def detect_cuda_device_count() -> int:
         return 0
 
 
+def resolve_agent_model_type(model_name: str) -> str:
+    normalized = (model_name or "").strip().lower()
+    if normalized.startswith("gemini"):
+        return "gemini_api"
+    if normalized.startswith("gpt-") or normalized.startswith("o1") or normalized.startswith("o3") or normalized.startswith("o4"):
+        return "openai_api"
+    return "transformer"
+
+
+def _sanitize_path_component(value: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "").strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned or "model"
+
+
+def resolve_extraction_cache_path(args: argparse.Namespace, use_model_reextract: bool) -> str:
+    if not use_model_reextract:
+        return ""
+    configured_cache_path = getattr(args, "extraction_cache_path", "")
+    if configured_cache_path:
+        return os.path.abspath(configured_cache_path)
+
+    preferred_model = args.agent1_model or args.agent2_model or "extractor"
+    preferred_type = resolve_agent_model_type(preferred_model)
+    cache_dir = os.path.join(PROJECT_ROOT, "reports", "extraction_cache")
+    cache_name = f"{preferred_type}_{_sanitize_path_component(preferred_model)}.jsonl"
+    return os.path.join(cache_dir, cache_name)
+
+
 def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
     """Translate CLI agent flags into a concrete execution configuration."""
     if args.use_dummy and (args.agent1_model or args.agent2_model):
@@ -97,6 +127,7 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
 
     proposal_source = "agent_extract" if requested_track == "end_to_end_extract" else "structured"
     strict_agent_execution = requested_track == "end_to_end_extract"
+    extraction_cache_path = resolve_extraction_cache_path(args, use_model_reextract)
     resolved_device = resolve_execution_device(args.device)
     cuda_device_count = detect_cuda_device_count() if resolved_device == "cuda" else 0
     primary_device = "cpu"
@@ -119,18 +150,26 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
     }
 
     if use_model_reextract:
+        agent1_model = args.agent1_model or "gemini-2.5-flash-lite"
+        agent2_model = args.agent2_model or args.agent1_model or agent1_model
+        agent1_model_type = resolve_agent_model_type(agent1_model)
+        agent2_model_type = resolve_agent_model_type(agent2_model)
         agent_configs["__slot_0__"].update({
-            "model_type": "transformer",
-            "model_name": args.agent1_model or "Qwen/Qwen2.5-1.5B-Instruct",
+            "model_type": agent1_model_type,
+            "model_name": agent1_model,
             "device": primary_device,
-            "quantization_mode": "4bit" if resolved_device == "cuda" else "none",
+            "extraction_cache_path": extraction_cache_path,
         })
         agent_configs["__slot_1__"].update({
-            "model_type": "transformer",
-            "model_name": args.agent2_model or args.agent1_model or "Qwen/Qwen2.5-1.5B-Instruct",
+            "model_type": agent2_model_type,
+            "model_name": agent2_model,
             "device": secondary_device,
-            "quantization_mode": "4bit" if resolved_device == "cuda" else "none",
+            "extraction_cache_path": extraction_cache_path,
         })
+        if agent1_model_type == "transformer":
+            agent_configs["__slot_0__"]["quantization_mode"] = "4bit" if resolved_device == "cuda" else "none"
+        if agent2_model_type == "transformer":
+            agent_configs["__slot_1__"]["quantization_mode"] = "4bit" if resolved_device == "cuda" else "none"
     else:
         agent_configs["__slot_0__"]["model_type"] = "structured"
         agent_configs["__slot_1__"]["model_type"] = "structured"
@@ -167,6 +206,7 @@ def build_execution_config(args: argparse.Namespace) -> Dict[str, Any]:
         "emit_scenario_bundles": args.emit_scenario_bundles,
         "allow_structured_fallback_in_end_to_end": args.allow_structured_fallback_in_end_to_end,
         "selected_modes": selected_modes,
+        "extraction_cache_path": extraction_cache_path,
     }
 
 
@@ -247,6 +287,98 @@ def load_real_conflicts_bundle(max_scenarios: int = None) -> List[Any]:
     if mab_limit is None or mab_limit > 0:
         scenarios.extend(load_benchmark("mab", subset="Conflict_Resolution", max_scenarios=mab_limit))
     return scenarios
+
+
+def collect_unique_extraction_texts(scenarios: List[Any]) -> List[str]:
+    seen = set()
+    ordered: List[str] = []
+    for scenario in scenarios:
+        scenario_dict = scenario_to_dict(scenario)
+        for event in scenario_dict.get("ordered_events", []) or []:
+            if event.get("event_type") != "write_proposal":
+                continue
+            proposal = event.get("proposal", {}) or {}
+            seed_text = (
+                proposal.get("raw_text")
+                or event.get("text")
+                or f"{proposal.get('subject', '')} {proposal.get('predicate', '')} {proposal.get('object_val', '')}".strip()
+            )
+            seed_text = str(seed_text or "").strip()
+            if not seed_text or seed_text in seen:
+                continue
+            seen.add(seed_text)
+            ordered.append(seed_text)
+    return ordered
+
+
+def warm_extraction_cache(
+    scenarios: List[Any],
+    execution_config: Dict[str, Any],
+    *,
+    output_dir: str,
+) -> Dict[str, Any]:
+    from src.local_models.runner import create_agent
+
+    unique_texts = collect_unique_extraction_texts(scenarios)
+    extractor_specs: Dict[tuple, Dict[str, Any]] = {}
+    for cfg in execution_config.get("agent_configs", {}).values():
+        model_type = cfg.get("model_type")
+        if model_type not in {"transformer", "gemini_api", "openai_api"}:
+            continue
+        spec_key = (
+            model_type,
+            cfg.get("model_name"),
+            cfg.get("device"),
+            cfg.get("quantization_mode"),
+            cfg.get("extraction_cache_path"),
+        )
+        if spec_key not in extractor_specs:
+            extractor_specs[spec_key] = dict(cfg)
+
+    if not extractor_specs:
+        raise ValueError("Extraction cache warm-up requires a real extractor model configuration.")
+
+    summary: Dict[str, Any] = {
+        "timestamp": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "unique_texts": len(unique_texts),
+        "extractors": [],
+    }
+    print(f"\nWarming extraction cache for {len(unique_texts)} unique write texts...")
+
+    for idx, cfg in enumerate(extractor_specs.values(), start=1):
+        agent = create_agent(
+            agent_id=f"warm_cache_agent_{idx}",
+            model_type=cfg.get("model_type"),
+            model_name=cfg.get("model_name"),
+            device=cfg.get("device", "cpu"),
+            quantization_mode=cfg.get("quantization_mode"),
+            strict_loading=True,
+            extraction_cache_path=cfg.get("extraction_cache_path"),
+        )
+        print(
+            f"  Extractor {idx}/{len(extractor_specs)}: "
+            f"{cfg.get('model_type')} {cfg.get('model_name')} -> {cfg.get('extraction_cache_path')}"
+        )
+        for text_index, text in enumerate(unique_texts, start=1):
+            if text_index == 1 or text_index % 250 == 0 or text_index == len(unique_texts):
+                print(f"    text {text_index}/{len(unique_texts)}")
+            agent.extract_memories(text)
+        stats = getattr(agent, "get_extraction_cache_stats", lambda: {})()
+        summary["extractors"].append(
+            {
+                "model_type": cfg.get("model_type"),
+                "model_name": cfg.get("model_name"),
+                "cache_path": cfg.get("extraction_cache_path"),
+                "stats": stats,
+            }
+        )
+
+    os.makedirs(output_dir, exist_ok=True)
+    summary_path = os.path.join(output_dir, "extraction_cache_warmup.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"[OK] Extraction cache warm-up summary saved to {summary_path}")
+    return summary
 
 
 def main():
@@ -359,6 +491,22 @@ def main():
         help="Allow explicit structured fallback when extraction fails. This is labeled separately and must not be reported as pure end-to-end extraction."
     )
     parser.add_argument(
+        "--extraction-cache-path",
+        type=str,
+        default=None,
+        help="Persistent JSONL cache for secondary-track extraction results. Default: reports/extraction_cache/<model>.jsonl"
+    )
+    parser.add_argument(
+        "--warm-extraction-cache-only",
+        action="store_true",
+        help="Phase 1 only: pre-extract unique write raw_text inputs into the persistent extraction cache, then exit without running benchmark evaluation."
+    )
+    parser.add_argument(
+        "--warm-extraction-cache-before-run",
+        action="store_true",
+        help="Warm the persistent extraction cache from unique write raw_text inputs before benchmark evaluation."
+    )
+    parser.add_argument(
         "--modes",
         type=str,
         default=None,
@@ -394,6 +542,10 @@ def main():
         execution_config = build_execution_config(args)
     except ValueError as exc:
         print(f"Error: {exc}")
+        return 1
+
+    if (args.warm_extraction_cache_only or args.warm_extraction_cache_before_run) and execution_config.get("proposal_source") != "agent_extract":
+        print("Error: extraction cache warm-up requires the secondary `end_to_end_extract` track with real extractor models.")
         return 1
 
     # Create output directory
@@ -495,6 +647,20 @@ def main():
                     t = scenario_to_dict(scen).get('scenario_type', 'unknown')
                     type_dist[t] = type_dist.get(t, 0) + 1
                 print(f"  Types: {type_dist}")
+
+            if args.warm_extraction_cache_only or args.warm_extraction_cache_before_run:
+                warm_summary = warm_extraction_cache(
+                    scenarios,
+                    execution_config,
+                    output_dir=args.output_dir,
+                )
+                if args.warm_extraction_cache_only:
+                    all_reports[benchmark_name] = {
+                        "num_scenarios": len(scenarios),
+                        "cache_warmup": warm_summary,
+                    }
+                    print(f"[OK] Warmed extraction cache only for {benchmark_name}; skipping benchmark evaluation.")
+                    continue
 
             if args.finalize_report_from_artifacts:
                 print(f"\nFinalizing report from artifacts: {args.finalize_report_from_artifacts}")

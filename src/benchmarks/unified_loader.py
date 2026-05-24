@@ -131,7 +131,8 @@ def save_scenarios_to_jsonl(
     """Save list of Scenario objects to JSONL file."""
     with open(output_path, 'w', encoding='utf-8') as f:
         for scenario in scenarios:
-            f.write(json.dumps(scenario.to_dict(), ensure_ascii=False) + '\n')
+            payload = scenario.to_dict() if hasattr(scenario, "to_dict") else scenario
+            f.write(json.dumps(payload, ensure_ascii=False) + '\n')
     print(f"Saved {len(scenarios)} scenarios to {output_path}")
 
 

@@ -15,6 +15,8 @@
 - [x] Repair benchmark-safe overwrite behavior.
 - [x] Restore `conflict_aware > lww` on the latest full 8-scenario code-state.
 - [x] Isolate `query-aware` gain beyond `no_query_support`.
+- [x] Freeze a pre-LLM hardening code-state with verified 2-scenario ablations before spending on secondary-track model runs.
+- [x] Expose explicit `raw_state_match`, `raw_memory_f1`, `canonical_state_match`, and `canonical_memory_f1` in research-facing reports.
 
 ## Remaining Must-Have
 - [ ] Decide the final claim for `lineage`.
@@ -48,10 +50,12 @@
   - benchmark-safe pipeline
   - `conflict_aware > lww` on latest full code-state
   - `query-aware > no_query_support`
+  - secondary-track high memory scores are often canonicalized, not raw-state-perfect
 - Not yet safe to claim:
   - lineage gives measured gain
   - full paper-faithful replication
   - broad generalization outside current benchmark surface
+  - strict `end_to_end_extract` portability to `LongMemEval` or `LoCoMo` on the current loader/eval contract
 
 ## Current Best Commands
 - Full `conflict_aware`:
@@ -63,6 +67,9 @@
 - Current 2-scenario ablation:
   - `python app/main.py --benchmark mab_conflict --max-scenarios 2 --use-dummy --modes conflict_aware --output-dir reports\paper_mode_mab2_pipeline_public_conflictonly_v2 --enable-error-analysis --emit-scenario-bundles`
   - `python app/main.py --benchmark mab_conflict --max-scenarios 2 --use-dummy --modes lww --output-dir reports\paper_mode_mab2_pipeline_public_lwwonly_v1 --enable-error-analysis --emit-scenario-bundles`
+- Pre-LLM freeze:
+  - `python app/main.py --benchmark mab_conflict --max-scenarios 2 --use-dummy --modes conflict_aware --output-dir reports\paper_mode_mab2_prellm_hardening_v1 --enable-error-analysis --emit-scenario-bundles`
+  - `python app/main.py --benchmark mab_conflict --max-scenarios 2 --use-dummy --include-conflict-aware-ablations --enable-error-analysis --emit-scenario-bundles --output-dir reports\paper_mode_mab2_prellm_ablation_v1`
 - Secondary-track pure `end_to_end_extract`:
   - `python app/main.py --benchmark mab_conflict --max-scenarios 2 --track end_to_end_extract --agent1-model Qwen/Qwen2.5-3B-Instruct --agent2-model Qwen/Qwen2.5-3B-Instruct --modes conflict_aware --output-dir reports\paper_mode_mab2_end_to_end_extract_realmodel_v1 --enable-error-analysis --emit-scenario-bundles`
 - Secondary-track fallback-labeled:
